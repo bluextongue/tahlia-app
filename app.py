@@ -9,7 +9,7 @@
 # - Voice-reactive ball: scales with assistant audio volume (and stays audible)
 # - Default port 5050
 
-import base64, re, time, random
+import base64, re, time, random, os
 from collections import deque
 from flask import Flask, request, jsonify, make_response
 
@@ -697,4 +697,4 @@ startBtn.onclick = async () => {
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))  # Render injects PORT
-    app.run(host="0.0.0.0", port=port, debug=True
+    app.run(host="0.0.0.0", port=port, debug=True)
