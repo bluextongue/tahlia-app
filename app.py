@@ -696,9 +696,6 @@ startBtn.onclick = async () => {
     return resp
 
 if __name__ == "__main__":
-    import sys
-    port = 5050  # default to 5050
-    if len(sys.argv) > 1:
-        try: port = int(sys.argv[1])
-        except: pass
+    import os
+    port = int(os.environ.get("PORT", 5050))  # Render requires PORT
     app.run(host="0.0.0.0", port=port, debug=True)
