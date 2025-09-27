@@ -1,18 +1,12 @@
 # app.py
 # Tahlia: Flask + OpenAI + ElevenLabs
-# - Curious-by-default vibe: user-specific questions; occasional tailored tip; rare short vignette
-# - Single-intro, no double-speak (server + client ack)
-# - Always-on ASR with final-only interrupt + echo filter
-# - Faster feel: lower interrupt grace (700ms), quicker ASR send (220ms), smaller TTS
-# - Allows deeper responses when appropriate (up to 5 sentences)
-# - Transcript/logs: modal panel (button opens, "X" closes; starts closed)
-# - Voice-reactive ball: scales with assistant audio volume (and stays audible)
-# - Default port 5050
+# - Per-user (cookie) session state; no global flags
+# - /api/intro is idempotent (no "double intro blocked")
+# - Client ASR/ACK controls turn-taking (server no longer hard-blocks)
+# - Green ball; Render PORT respected
 
 import base64, re, time, random, os
-from collections import deque
 from flask import Flask, request, jsonify, make_response, session as flask_session
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -22,27 +16,28 @@ ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a60665
 ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
 
 OPENAI_API_KEY  = "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"
-OPENAI_MODEL    = "gpt-4o-mini"  # try "o4-mini" or "o4" for smarter
-
+OPENAI_MODEL    = "gpt-4o-mini"
 ASSISTANT_NAME  = "Tahlia"
 
 # ========= HTTP session with retries =========
 session = requests.Session()
-retry = Retry(total=3, connect=3, read=3, status=3, backoff_factor=0.35,
-              status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"], raise_on_status=False)
+retry = Retry(
+    total=3, connect=3, read=3, status=3, backoff_factor=0.35,
+    status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"],
+    raise_on_status=False
+)
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 DEFAULT_TIMEOUT = (5, 55)
 
-# ========= Flask app =========
+# ========= Flask (per-user cookie session) =========
 app = Flask(__name__)
-# IMPORTANT: set a real secret in production. For now this enables per-user session state.
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "please_change_this_secret_key")
+# Safer defaults when running behind HTTPS (Render)
+if os.environ.get("RENDER", "") or "onrender.com" in os.environ.get("RENDER_EXTERNAL_URL", ""):
+    app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax")
 
-# ========= In-memory defaults for per-user session =========
-# We store small lists/strings/bools in Flask's signed cookie session (JSON-serializable).
-# Helpers to read/update with defaults and keep max length caps.
-
+# --- tiny helpers to work with the cookie session ---
 def sget(key, default):
     if key not in flask_session:
         flask_session[key] = default
@@ -59,25 +54,23 @@ def append_capped_list(key, item, cap):
     sset(key, lst)
     return lst
 
-# ========= Prompts and rules (curious, user-specific) =========
+# ========= Prompts and rules =========
 SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, a warm, natural, therapist-like conversational partner. "
     "Default stance: be genuinely curious and specific to the user's situation—ask focused, non-generic questions that help get to the root of what’s going on. "
     "Keep 2–3 sentences by default (up to 5 if the user shares details). "
     "Use one of these styles per turn (don’t stack them back-to-back): "
-    "• Inquire: reflect briefly, then ask 1 precise question that narrows the real issue (e.g., where/when/who/what made it harder). "
-    "• Tip (sometimes): offer a tailored, bite-sized suggestion tied to what the user said—no menus of exercises, just one concrete move. "
-    "• Story (rarely): share a very short, relatable vignette ('some people find…') to normalize or illustrate, then leave space for them. "
-    "Avoid generic platitudes and generic 'how are you coping' unless the user invites it. "
-    "Vary your wording; avoid repeating lines. "
-    "Avoid the phrases “I’m here with you” and “Let’s take it one step at a time.” "
-    "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately."
+    "• Inquire: reflect briefly, then ask 1 precise question that narrows the real issue. "
+    "• Tip (sometimes): one tailored, concrete suggestion tied to what they said. "
+    "• Story (rarely): a very short vignette to normalize, then invite them back. "
+    "Avoid platitudes; vary wording. Avoid the phrases “I’m here with you” and “Let’s take it one step at a time.” "
+    "Crisis: if imminent self-harm, advise 911 and 988 immediately."
 )
 
 CRISIS_TRIGGERS = ("kill myself","suicide","hurt myself","harm myself","overdose","end my life","take my life","self harm","self-harm")
-STOP_WORDS = ("stop","quit","end","goodbye","end call","terminate")
+STOP_WORDS      = ("stop","quit","end","goodbye","end call","terminate")
 
-# ========= Helpers =========
+# ========= Text helpers =========
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -95,8 +88,7 @@ def concise(text: str, max_chars: int = 520, max_sents: int = 5) -> str:
     sents = re.split(r"(?<=[.!?])\s+", t)
     t = " ".join(sents[:max_sents]).strip()
     if len(t) > max_chars:
-        t = t[:max_chars].rstrip()
-        t = re.sub(r"\s+\S*$", "", t).rstrip(",;:.!? ")
+        t = re.sub(r"\s+\S*$", "", t[:max_chars]).rstrip(",;:.!? ")
     return t
 
 def jaccard(a: set, b: set) -> float:
@@ -130,20 +122,14 @@ def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
 
 def choose_style() -> str:
-    """
-    Bias toward 'inquire' (curious, specific), sometimes 'tip', rarely 'story'.
-    Avoid repeating non-inquire styles back-to-back.
-    """
     recent_style = sget("RECENT_STYLE", [])
     last = recent_style[-1] if recent_style else None
     weights = {"inquire": 0.60, "tip": 0.30, "story": 0.10}
     if last in ("tip", "story"):
         weights = {"inquire": 0.75, "tip": 0.18, "story": 0.07}
     r = random.random()
-    if r < weights["inquire"]:
-        return "inquire"
-    elif r < weights["inquire"] + weights["tip"]:
-        return "tip"
+    if r < weights["inquire"]: return "inquire"
+    elif r < weights["inquire"] + weights["tip"]: return "tip"
     return "story"
 
 # ========= OpenAI Chat =========
@@ -164,56 +150,48 @@ def llm_reply(user_text: str) -> tuple[str, str]:
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": user_text})
 
-    # Style steering for THIS reply
+    # style steer
     style = choose_style()
     if style == "inquire":
-        msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Inquire style. Give a short reflection tied to their words, "
-            "then ask ONE precise, non-generic question that helps pinpoint the root cause or a specific blocker. "
-            "No exercise suggestions in this turn."
-        )})
+        msgs.append({"role": "system", "content":
+            "For THIS reply: Inquire. Short reflection tied to their words, "
+            "then ONE precise question. No exercises this turn."})
     elif style == "tip":
-        msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Tip style. Offer ONE tailored, concrete suggestion tightly linked to what they said. "
-            "Keep it tiny and situational (no list, no menu of exercises). Optionally end with a short follow-up question."
-        )})
-    else:  # story
-        msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Story style. Share a very brief, relatable vignette ('some people find…') "
-            "that normalizes their experience, then invite them back with a soft question or reflection. Keep it 2–3 sentences."
-        )})
+        msgs.append({"role": "system", "content":
+            "For THIS reply: Tip. ONE tiny, tailored suggestion tied to what they said. "
+            "Optionally 1 short follow-up question."})
+    else:
+        msgs.append({"role": "system", "content":
+            "For THIS reply: Story. Very brief vignette to normalize, then invite them back. 2–3 sentences."})
 
     dbg = "ok"
     try:
         reply = openai_chat(msgs) or \
                 "Quick gut check: what part of this hits the hardest for you today? If it helps, name the exact moment it spikes."
     except Exception:
-        reply = ("Let’s zero in: what was the moment today where this felt most intense—who was there and what changed right before it?")
+        reply = "Let’s zero in: what was the moment today where this felt most intense—who was there and what changed right before it?"
     final = concise(reply)
 
-    # Allow more inquisitiveness; only block if last TWO also ended with questions
     recent_assist = sget("RECENT_ASSIST", [])
     recent_qs = sum(1 for r in recent_assist[-3:] if ends_with_question(r))
     if ends_with_question(final) and recent_qs >= 2:
-        msgs.append({"role": "system", "content": "Regenerate without ending in a question. Keep it specific and user-focused."})
+        msgs.append({"role": "system", "content": "Regenerate without ending in a question; keep it specific."})
         try:
             alt = openai_chat(msgs) or final
-            final = concise(alt)
-            dbg = "regen_no_question"
+            final = concise(alt); dbg = "regen_no_question"
         except Exception:
             pass
 
     low = norm(final)
     if low.startswith(BANNED_PREFIXES) or too_similar(final, recent_assist):
-        msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user's last message. Allow up to 5 sentences if helpful."})
+        msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user."})
         try:
             alt = openai_chat(msgs) or final
-            final = concise(alt)
-            dbg = "regen_diversity"
+            final = concise(alt); dbg = "regen_diversity"
         except Exception:
-            dbg = "ok"
+            pass
 
-    # Record chosen style and finalize (per-user session)
+    # record (per-user)
     append_capped_list("RECENT_STYLE", style, 4)
     append_capped_list("history", ("user", user_text), 16)
     append_capped_list("history", ("assistant", final), 16)
@@ -226,16 +204,14 @@ def tts_b64(text: str):
     safe_text = (text or "").strip()
     if not safe_text: return "", ""
     safe_text = safe_text[:650]
-
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {
         "text": safe_text,
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
-        "output_format": "mp3_22050_64"  # smaller & faster than 44.1k/128
+        "output_format": "mp3_22050_64"
     }
-
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
         try:
             r = session.post(url, headers=headers, json=payload, timeout=timeout)
@@ -249,26 +225,26 @@ def tts_b64(text: str):
             time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
-# ========= API: introduction =========
+# ========= API: introduction (idempotent) =========
 @app.post("/api/intro")
 def api_intro():
-    if sget("INTRO_SENT", False):
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_intro_blocked"}), 200
-
+    first_time = not sget("INTRO_SENT", False)
     intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
 
-    # reset per-user state
-    sset("history", [])
-    sset("RECENT_ASSIST", [])
-    sset("RECENT_STYLE", [])
-    sset("INTRO_SENT", True)
-    sset("LAST_SPOKE", None)
-    sset("LAST_REPLY", intro)
-
-    append_capped_list("RECENT_ASSIST", intro, 6)
+    if first_time:
+        # reset per-user state
+        sset("history", []); sset("RECENT_ASSIST", []); sset("RECENT_STYLE", [])
+        sset("INTRO_SENT", True); sset("LAST_SPOKE", None); sset("LAST_REPLY", intro)
+        append_capped_list("RECENT_ASSIST", intro, 6)
+    else:
+        # already introduced: be idempotent (return same intro instead of error)
+        intro = sget("LAST_REPLY", intro)
 
     audio, tts_err = tts_b64(intro)
-    return jsonify({"reply": intro, "audio": audio, "tts_error": tts_err, "dbg": "intro"}), 200
+    return jsonify({
+        "reply": intro, "audio": audio, "tts_error": tts_err,
+        "dbg": "intro" if first_time else "intro_repeat"
+    }), 200
 
 # ========= API: chat reply =========
 @app.post("/api/reply")
@@ -280,31 +256,24 @@ def api_reply():
 
     lower_text = norm(user_text)
 
-    # Stop command
+    # stop
     if contains_stop_command(lower_text):
-        sset("history", [])
-        sset("RECENT_ASSIST", [])
-        sset("RECENT_STYLE", [])
-        sset("INTRO_SENT", False)
-        sset("LAST_SPOKE", None)
-        sset("LAST_REPLY", "")
+        sset("history", []); sset("RECENT_ASSIST", []); sset("RECENT_STYLE", [])
+        sset("INTRO_SENT", False); sset("LAST_SPOKE", None); sset("LAST_REPLY", "")
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "stop_word"}), 200
 
-    # Ignore if client accidentally posts the bot's last reply
+    # ignore client echo of bot line
     if lower_text == norm(sget("LAST_REPLY", "")):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "echo_bot_line"}), 200
 
-    if len(lower_text) < 1:
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "too_short"}), 200
-
-    # Mark that the last confirmed speaker is the user
+    # mark that the last confirmed speaker is the user
     sset("LAST_SPOKE", "user")
 
-    # prevent duplicate user messages
+    # avoid dup user lines
     if not not_duplicate_user(lower_text):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "duplicate_user"}), 200
 
-    # Crisis path
+    # crisis fast-path
     if detect_crisis(lower_text):
         reply = concise(
             "I’m really glad you told me. If you’re in immediate danger, call 911. "
@@ -315,18 +284,16 @@ def api_reply():
         append_capped_list("history", ("assistant", reply), 16)
         dbg = "crisis"
     else:
-        # (kept your original guard; with per-user state this should not misfire)
-        if sget("LAST_SPOKE", "user") != "user":
-            return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_speak_guard"}), 200
+        # NOTE: previously there was a server ‘double_speak_guard’. Removed so it can’t trip cross-user.
         reply, dbg = llm_reply(user_text)
 
-    # Block exact duplicate bot lines
+    # de-dup exact bot line
     if not not_duplicate_bot(reply):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "dedup_bot"}), 200
 
     audio, tts_err = tts_b64(reply)
     sset("LAST_REPLY", reply)
-    sset("LAST_SPOKE", "assistant")
+    # we rely on /api/ack_assistant from the client to set LAST_SPOKE="assistant"
     return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
 
 # ========= API: assistant speech ACK =========
@@ -335,15 +302,11 @@ def api_ack_assistant():
     sset("LAST_SPOKE", "assistant")
     return jsonify({"ok": True})
 
-# ========= API: reset memory =========
+# ========= API: reset (per-user) =========
 @app.post("/api/reset")
 def api_reset():
-    sset("history", [])
-    sset("RECENT_ASSIST", [])
-    sset("RECENT_STYLE", [])
-    sset("INTRO_SENT", False)
-    sset("LAST_SPOKE", None)
-    sset("LAST_REPLY", "")
+    sset("history", []); sset("RECENT_ASSIST", []); sset("RECENT_STYLE", [])
+    sset("INTRO_SENT", False); sset("LAST_SPOKE", None); sset("LAST_REPLY", "")
     return jsonify({"ok": True})
 
 # ========= Health/ping =========
@@ -384,7 +347,6 @@ def index():
   .line { padding:6px 8px; border-bottom:1px dashed #20242a; white-space:pre-wrap; word-break:break-word; }
   .user { color:#c9f0ff; } .bot{ color:#d7ffe0; } .sys{ color:#ffd7d7; } .meta{ font-size:12px; color:#9aa4af; }
 
-  /* Hidden default audio element */
   #player { display:none; }
 </style>
 </head>
@@ -408,7 +370,6 @@ def index():
   </div>
 
 <script>
-/* ---------- DOM ---------- */
 const player = document.getElementById("player");
 const startBtn = document.getElementById("startBtn");
 const logsBtn = document.getElementById("logsBtn");
@@ -417,7 +378,6 @@ const modalBackdrop = document.getElementById("modalBackdrop");
 const modalClose = document.getElementById("modalClose");
 const transcriptEl = document.getElementById("transcript");
 
-/* ---------- Logs ---------- */
 function logLine(kind, text){
   const div = document.createElement("div");
   div.className = "line " + (kind || "meta");
@@ -430,37 +390,31 @@ function logBot(t){ logLine("bot",  "Tahlia: " + t); }
 function logErr(t){ logLine("sys",  "Error: " + t); }
 function logMeta(t){ logLine("meta", t); }
 
-/* ---------- Modal controls ---------- */
 function openModal(){ modalBackdrop.style.display = "flex"; }
 function closeModal(){ modalBackdrop.style.display = "none"; }
 logsBtn.onclick = openModal;
 modalClose.onclick = closeModal;
 modalBackdrop.addEventListener("click", (e) => { if (e.target === modalBackdrop) closeModal(); });
 
-/* ---------- State ---------- */
 let rec = null;
 let session = false;
 let lastBotReply = "";
 let introPlayed = false;
 
-/* ASR state machine */
-let asrState = "idle"; // "idle"|"starting"|"running"|"stopping"
+let asrState = "idle";
 let recIsStarting = false;
 let lastASRStartTs = 0;
 let asrWatchdog = null;
 
-/* Interrupt controls (final-only interrupt + echo filter) */
 let assistantSpeaking = false;
 let wantsInterrupt = false;
 let botSpeakingSince = 0;
 const INTERRUPT_GRACE_MS = 700;
-const MIN_FINAL_LEN = 1;
 let lastSendTs = 0;
 const ECHO_WINDOW_MS = 1800;
 
-/* ---------- Voice-reactive ball (assistant audio only) ---------- */
 let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null;
-let volEMA = 0; // smoothed volume 0..1
+let volEMA = 0;
 
 function setupAudioAnalyzer(){
   if (audioCtx) return;
@@ -471,16 +425,10 @@ function setupAudioAnalyzer(){
     analyser.fftSize = 2048;
     const bufLen = analyser.frequencyBinCount;
     dataArray = new Uint8Array(bufLen);
-
-    // tap the signal for analysis…
     mediaSrc.connect(analyser);
-    // …and ALSO route the actual audio to the speakers (do NOT mute)
     mediaSrc.connect(audioCtx.destination);
-
     animateBall();
-  } catch(e){
-    logErr("Audio analyzer init failed: " + e);
-  }
+  } catch(e){ logErr("Audio analyzer init failed: " + e); }
 }
 
 function animateBall(){
@@ -491,17 +439,14 @@ function animateBall(){
     const v = (dataArray[i] - 128) / 128;
     sum += v * v;
   }
-  const rms = Math.sqrt(sum / dataArray.length); // ~0..1
+  const rms = Math.sqrt(sum / dataArray.length);
   const target = assistantSpeaking ? rms : 0;
   volEMA = volEMA * 0.85 + target * 0.15;
-
   const scale = 1 + Math.min(0.9, volEMA * 2.2);
   ball.style.transform = "scale(" + scale.toFixed(3) + ")";
-
   requestAnimationFrame(animateBall);
 }
 
-/* ---------- Utils ---------- */
 function words(str){
   return (str || "").toLowerCase().replace(/[^\\w\\s']/g, " ").split(/\\s+/).filter(Boolean);
 }
@@ -523,7 +468,6 @@ function likelyEcho(userFinal, botLine){
   return sim >= 0.6 || prefixish;
 }
 
-/* ---------- ASR control ---------- */
 async function startASRSafe(delay = 0) {
   if (!rec || !session) return;
   if (asrState === "running" || asrState === "starting") return;
@@ -531,10 +475,7 @@ async function startASRSafe(delay = 0) {
   try {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try { rec.start(); } catch(_) {}
-    console.debug("ASR start requested");
-  } finally {
-    setTimeout(() => { recIsStarting = false; }, 120);
-  }
+  } finally { setTimeout(() => { recIsStarting = false; }, 120); }
 }
 function stopASRSafe() {
   if (!rec) return;
@@ -551,51 +492,36 @@ function ensureASR(){
   rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
 
   rec.onstart = () => { asrState = "running"; lastASRStartTs = Date.now(); logMeta("ASR started"); };
-  rec.onend   = () => {
-    if (!session) { asrState = "idle"; return; }
-    asrState = "idle"; logMeta("ASR ended → restarting"); startASRSafe(250);
-  };
-  rec.onerror = (e) => {
-    if (!session) return;
-    asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " → restarting");
-    setTimeout(() => startASRSafe(200), 300);
-  };
+  rec.onend   = () => { if (!session) { asrState = "idle"; return; } asrState = "idle"; logMeta("ASR ended → restarting"); startASRSafe(250); };
+  rec.onerror = (e) => { if (!session) return; asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " → restarting"); setTimeout(() => startASRSafe(200), 300); };
 
   rec.onresult = (evt) => {
     let finalText = "";
     const now = Date.now();
-
     for (let i = evt.resultIndex; i < evt.results.length; i++) {
       const res = evt.results[i];
       const txt = (res[0]?.transcript || "").trim();
-
       if (!res.isFinal && txt) {
         const elapsed = now - botSpeakingSince;
         if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
       }
-
       if (res.isFinal) finalText += txt + " ";
     }
-
     finalText = (finalText || "").trim();
     if (!finalText) return;
-
     if (likelyEcho(finalText, lastBotReply)) { logMeta("Echo filtered"); return; }
     if (assistantSpeaking && !wantsInterrupt) return;
     if (assistantSpeaking && wantsInterrupt) { stopBotAudio(); wantsInterrupt = false; }
-
     if (finalText.length < 1) return;
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
-    if (now2 - lastSendTs < 220) return;  // faster debounce
+    if (now2 - lastSendTs < 220) return;
     lastSendTs = now2;
-
     logUser(finalText);
     sendToBot(finalText);
   };
 
-  // Watchdog: every 6s
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
@@ -608,7 +534,6 @@ function ensureASR(){
   return rec;
 }
 
-/* ---------- Networking ---------- */
 async function safeJson(resp){
   const text = await resp.text();
   try { return JSON.parse(text); } catch { return { error_text: text }; }
@@ -616,13 +541,11 @@ async function safeJson(resp){
 
 function stopBotAudio(){
   try { player.pause(); player.src = ""; player.currentTime = 0; } catch(_) {}
-  assistantSpeaking = false;
-  botSpeakingSince = 0;
+  assistantSpeaking = false; botSpeakingSince = 0;
 }
 
 async function sendToBot(text){
   const lw = (text || "").trim().toLowerCase();
-
   if (["stop","quit","end","goodbye","end call","terminate"].includes(lw) ||
       (lw.length <= 24 && ["stop","quit","end","goodbye","end call","terminate"].some(k => lw.includes(k)))) {
     session = false; introPlayed = false;
@@ -630,11 +553,7 @@ async function sendToBot(text){
     if (asrWatchdog) { clearInterval(asrWatchdog); asrWatchdog = null; }
     stopBotAudio();
     startBtn.textContent = "Start Conversation";
-    try {
-      const r = await fetch("/api/reply", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
-      const d = await safeJson(r);
-      if (d.dbg) logMeta("Server: " + d.dbg); if (d.tts_error) logErr("TTS: " + d.tts_error);
-    } catch(e){ logErr("Stop send failed: " + e); }
+    try { await fetch("/api/reply", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) }); } catch(_){}
     return;
   }
 
@@ -646,7 +565,6 @@ async function sendToBot(text){
       body: JSON.stringify({ text })
     });
     const d = await safeJson(r);
-
     if (d.dbg) logMeta("Server: " + d.dbg);
     if (d.error_text) logErr("Server raw: " + d.error_text);
     if (d.tts_error) logErr("TTS: " + d.tts_error);
@@ -664,12 +582,9 @@ async function sendToBot(text){
         fetch("/api/ack_assistant", { method:"POST" }).catch(()=>{});
       } catch(e){ logErr("Audio play failed: " + e); }
     }
-  } catch(e){
-    logErr("Fetch /api/reply failed: " + e);
-  }
+  } catch(e){ logErr("Fetch /api/reply failed: " + e); }
 }
 
-/* ---------- UI events ---------- */
 player.onpause = () => { assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; };
 player.onended = () => { assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; };
 
@@ -682,12 +597,12 @@ if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
   });
 }
 
+logsBtn.onclick = openModal;
+
 startBtn.onclick = async () => {
   if (!session) {
     try {
-      await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      });
+      await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     } catch(e) { alert("Microphone permission required"); return; }
 
     const r = ensureASR(); if (!r) return;
@@ -731,4 +646,5 @@ startBtn.onclick = async () => {
 # ========= Run (Render-compatible) =========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))  # Render sets PORT
+    # NOTE: debug=True shows PIN in logs; set to False in production if you prefer.
     app.run(host="0.0.0.0", port=port, debug=True)
