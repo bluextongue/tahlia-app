@@ -12,6 +12,7 @@
 import base64, re, time, random
 from collections import deque
 from flask import Flask, request, jsonify, make_response
+from flask import session as flask_session  # <-- per-user session storage
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -36,12 +37,12 @@ DEFAULT_TIMEOUT = (5, 55)
 
 # ========= Flask + short memory =========
 app = Flask(__name__)
+app.secret_key = "change_this_secret"  # required for per-user sessions; set via env for production
+
 history = deque(maxlen=16)
 
-# ---- session state flags (server) ----
-INTRO_SENT  = False
-LAST_SPOKE  = None           # "user" | "assistant" | None
-LAST_REPLY  = ""             # last assistant text (to block dupes)
+# ---- (kept as server-level; safe to keep) ----
+LAST_REPLY  = ""             # last assistant text (used only to block exact dupes globally)
 RECENT_ASSIST = deque(maxlen=6)
 RECENT_STYLE  = deque(maxlen=4)   # tracks 'inquire' | 'tip' | 'story'
 
@@ -115,10 +116,6 @@ def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
 
 def choose_style() -> str:
-    """
-    Bias toward 'inquire' (curious, specific), sometimes 'tip', rarely 'story'.
-    Avoid repeating non-inquire styles back-to-back.
-    """
     last = RECENT_STYLE[-1] if RECENT_STYLE else None
     weights = {"inquire": 0.60, "tip": 0.30, "story": 0.10}
     if last in ("tip", "story"):
@@ -215,7 +212,7 @@ def tts_b64(text: str):
         "text": safe_text,
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
-        "output_format": "mp3_22050_64"  # smaller & faster than 44.1k/128
+        "output_format": "mp3_22050_64"
     }
 
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
@@ -231,25 +228,26 @@ def tts_b64(text: str):
             time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
-# ========= API: introduction =========
+# ========= API: introduction (now per-session) =========
 @app.post("/api/intro")
 def api_intro():
-    global INTRO_SENT, LAST_SPOKE, LAST_REPLY, RECENT_ASSIST, RECENT_STYLE
-    if INTRO_SENT:
+    global LAST_REPLY, RECENT_ASSIST, RECENT_STYLE
+    if flask_session.get("intro_sent"):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_intro_blocked"}), 200
+
     intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
     history.clear(); RECENT_ASSIST.clear(); RECENT_STYLE.clear()
-    INTRO_SENT = True
-    LAST_SPOKE = None
+    flask_session["intro_sent"] = True
+    flask_session["last_spoke"] = None  # reset per-session speaker
     LAST_REPLY = intro
     RECENT_ASSIST.append(intro)
     audio, tts_err = tts_b64(intro)
     return jsonify({"reply": intro, "audio": audio, "tts_error": tts_err, "dbg": "intro"}), 200
 
-# ========= API: chat reply =========
+# ========= API: chat reply (now uses per-session speaker) =========
 @app.post("/api/reply")
 def api_reply():
-    global INTRO_SENT, LAST_SPOKE, LAST_REPLY
+    global LAST_REPLY
     data = request.get_json(force=True, silent=False) or {}
     user_text = (data.get("text") or "").strip()
     if not user_text:
@@ -257,11 +255,11 @@ def api_reply():
 
     lower_text = norm(user_text)
 
-    # Stop command
+    # Stop command: clear per-session flags
     if contains_stop_command(lower_text):
         history.clear()
-        INTRO_SENT = False
-        LAST_SPOKE = None
+        flask_session.pop("intro_sent", None)
+        flask_session["last_spoke"] = None
         LAST_REPLY = ""
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "stop_word"}), 200
 
@@ -272,12 +270,8 @@ def api_reply():
     if len(lower_text) < 1:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "too_short"}), 200
 
-    # Mark that the last confirmed speaker is the user
-    LAST_SPOKE = "user"
-
-    # prevent duplicate user messages
-    if not not_duplicate_user(lower_text):
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "duplicate_user"}), 200
+    # Mark user as the last confirmed speaker (per-session)
+    flask_session["last_spoke"] = "user"
 
     # Crisis path
     if detect_crisis(lower_text):
@@ -289,11 +283,10 @@ def api_reply():
         history.append(("user", user_text)); history.append(("assistant", reply))
         dbg = "crisis"
     else:
-        if LAST_SPOKE != "user":
-            return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_speak_guard"}), 200
+        # (Removed server-side 'double_speak_guard' global check; rely on per-session last_spoke + client ACK)
         reply, dbg = llm_reply(user_text)
 
-    # Block exact duplicate bot lines
+    # Block exact duplicate bot lines (global dedupe is OK)
     if not not_duplicate_bot(reply):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "dedup_bot"}), 200
 
@@ -301,27 +294,31 @@ def api_reply():
     LAST_REPLY = reply
     return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
 
-# ========= API: assistant speech ACK =========
+# ========= API: assistant speech ACK (per-session) =========
 @app.post("/api/ack_assistant")
 def api_ack_assistant():
-    global LAST_SPOKE
-    LAST_SPOKE = "assistant"
+    flask_session["last_spoke"] = "assistant"
     return jsonify({"ok": True})
 
-# ========= API: reset memory =========
+# ========= API: reset memory (per-session cleanup) =========
 @app.post("/api/reset")
 def api_reset():
-    global INTRO_SENT, LAST_SPOKE, LAST_REPLY, RECENT_ASSIST, RECENT_STYLE
+    global LAST_REPLY, RECENT_ASSIST, RECENT_STYLE
     history.clear(); RECENT_ASSIST.clear(); RECENT_STYLE.clear()
-    INTRO_SENT = False
-    LAST_SPOKE = None
+    flask_session.pop("intro_sent", None)
+    flask_session["last_spoke"] = None
     LAST_REPLY = ""
     return jsonify({"ok": True})
 
-# ========= Health/ping =========
+# ========= Health/ping (reports per-session intro flag) =========
 @app.get("/api/ping")
 def api_ping():
-    return jsonify({"ok": True, "ts": time.time(), "intro_sent": INTRO_SENT, "last_spoke": LAST_SPOKE})
+    return jsonify({
+        "ok": True,
+        "ts": time.time(),
+        "intro_sent": bool(flask_session.get("intro_sent")),
+        "last_spoke": flask_session.get("last_spoke")
+    })
 
 # ========= UI (client) =========
 @app.get("/")
@@ -411,7 +408,7 @@ let lastBotReply = "";
 let introPlayed = false;
 
 /* ASR state machine */
-let asrState = "idle"; // "idle"|"starting"|"running"|"stopping"
+let asrState = "idle";
 let recIsStarting = false;
 let lastASRStartTs = 0;
 let asrWatchdog = null;
@@ -427,7 +424,7 @@ const ECHO_WINDOW_MS = 1800;
 
 /* ---------- Voice-reactive ball (assistant audio only) ---------- */
 let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null;
-let volEMA = 0; // smoothed volume 0..1
+let volEMA = 0;
 
 function setupAudioAnalyzer(){
   if (audioCtx) return;
@@ -439,9 +436,7 @@ function setupAudioAnalyzer(){
     const bufLen = analyser.frequencyBinCount;
     dataArray = new Uint8Array(bufLen);
 
-    // tap the signal for analysis…
     mediaSrc.connect(analyser);
-    // …and ALSO route the actual audio to the speakers (do NOT mute)
     mediaSrc.connect(audioCtx.destination);
 
     animateBall();
@@ -458,7 +453,7 @@ function animateBall(){
     const v = (dataArray[i] - 128) / 128;
     sum += v * v;
   }
-  const rms = Math.sqrt(sum / dataArray.length); // ~0..1
+  const rms = Math.sqrt(sum / dataArray.length);
   const target = assistantSpeaking ? rms : 0;
   volEMA = volEMA * 0.85 + target * 0.15;
 
@@ -498,7 +493,6 @@ async function startASRSafe(delay = 0) {
   try {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try { rec.start(); } catch(_) {}
-    console.debug("ASR start requested");
   } finally {
     setTimeout(() => { recIsStarting = false; }, 120);
   }
@@ -538,7 +532,7 @@ function ensureASR(){
 
       if (!res.isFinal && txt) {
         const elapsed = now - botSpeakingSince;
-        if (assistantSpeaking && botSpeakingSince && elapsed > INTERRUPT_GRACE_MS) wantsInterrupt = true;
+        if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
       }
 
       if (res.isFinal) finalText += txt + " ";
@@ -551,7 +545,7 @@ function ensureASR(){
     if (assistantSpeaking && !wantsInterrupt) return;
     if (assistantSpeaking && wantsInterrupt) { stopBotAudio(); wantsInterrupt = false; }
 
-    if (finalText.length < MIN_FINAL_LEN) return;
+    if (finalText.length < 1) return;
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
