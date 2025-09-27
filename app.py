@@ -1,7 +1,7 @@
 # app.py
 # Tahlia: Flask + OpenAI + ElevenLabs (per-user sessions, simplified therapist vibe)
 
-import os, base64, re, time, random
+import os, base64, re, time
 from flask import Flask, request, jsonify, make_response, session as fsession
 
 import requests
@@ -54,7 +54,7 @@ def append_capped(key, item, cap):
 SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, a warm, normal-sounding therapist-like companion. "
     "Speak naturally. Be brief (1–3 sentences). Reply directly to what the user just said. "
-    "Show empathy without clichés. If they greet you, greet them back. "
+    "If they greet you, greet them back. Reflect their words and ask at most one gentle, relevant question. "
     "Avoid generic checklists; no menus of coping strategies unless asked. "
     "If user indicates imminent self-harm, advise calling 911 or texting/calling 988 (U.S.)."
 )
@@ -107,11 +107,11 @@ def llm_reply(user_text: str) -> tuple[str, str]:
     try:
         reply = openai_chat(msgs)
         if not reply:
-            reply = "Thanks for telling me. What’s on your mind right now?"
+            reply = "Thanks for saying hi. What’s on your mind right now?"
             dbg = "fallback_empty"
-    except Exception as e:
+    except Exception:
         reply = "Sorry—had a hiccup for a second. What would you like to talk about?"
-        dbg = f"openai_error"
+        dbg = "openai_error"
 
     final = concise(reply)
 
@@ -191,7 +191,7 @@ def api_reply():
         sset("LAST_REPLY", "")
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "stop_word"}), 200
 
-    # Ignore exact echo of last bot line (client sometimes re-posts)
+    # Ignore exact echo of last bot line from client (not server dedup; just echo-protection)
     if lower_text == norm(sget("LAST_REPLY", "")):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "echo_bot_line"}), 200
 
@@ -214,10 +214,7 @@ def api_reply():
     # Normal path
     reply, dbg = llm_reply(user_text)
 
-    # Very light de-dupe: only block if reply equals last reply exactly
-    if norm(reply) == norm(sget("LAST_REPLY", "")):
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "dedup_exact"}), 200
-
+    # NOTE: removed server-side dedup that caused 'dedup_exact'
     audio, tts_err = tts_b64(reply)
     sset("LAST_REPLY", reply)
     sset("LAST_SPOKE", "assistant")
