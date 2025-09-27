@@ -1,9 +1,7 @@
 # app.py
 # Tahlia: Flask + OpenAI + ElevenLabs
-# - Per-user (cookie) session state; no global flags
-# - /api/intro is idempotent (no "double intro blocked")
-# - Client ASR/ACK controls turn-taking (server no longer hard-blocks)
-# - Green ball; Render PORT respected
+# Per-user state (no global clashes), robust de-dupe, gentler echo/interrupt
+# Ball is pink; Render-ready port handling
 
 import base64, re, time, random, os
 from flask import Flask, request, jsonify, make_response, session as flask_session
@@ -17,30 +15,25 @@ ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
 
 OPENAI_API_KEY  = "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"
 OPENAI_MODEL    = "gpt-4o-mini"
+
 ASSISTANT_NAME  = "Tahlia"
 
 # ========= HTTP session with retries =========
-session = requests.Session()
-retry = Retry(
-    total=3, connect=3, read=3, status=3, backoff_factor=0.35,
-    status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"],
-    raise_on_status=False
-)
+http = requests.Session()
+retry = Retry(total=3, connect=3, read=3, status=3, backoff_factor=0.35,
+              status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"],
+              raise_on_status=False)
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-session.mount("https://", adapter); session.mount("http://", adapter)
+http.mount("https://", adapter); http.mount("http://", adapter)
 DEFAULT_TIMEOUT = (5, 55)
 
-# ========= Flask (per-user cookie session) =========
+# ========= Flask app (per-user session via signed cookies) =========
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "please_change_this_secret_key")
-# Safer defaults when running behind HTTPS (Render)
-if os.environ.get("RENDER", "") or "onrender.com" in os.environ.get("RENDER_EXTERNAL_URL", ""):
-    app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax")
 
-# --- tiny helpers to work with the cookie session ---
+# ---- tiny helpers for session state ----
 def sget(key, default):
-    if key not in flask_session:
-        flask_session[key] = default
+    if key not in flask_session: flask_session[key] = default
     return flask_session[key]
 
 def sset(key, value):
@@ -49,28 +42,31 @@ def sset(key, value):
 def append_capped_list(key, item, cap):
     lst = sget(key, [])
     lst.append(item)
-    if len(lst) > cap:
-        lst = lst[-cap:]
+    if len(lst) > cap: lst = lst[-cap:]
     sset(key, lst)
     return lst
 
 # ========= Prompts and rules =========
 SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, a warm, natural, therapist-like conversational partner. "
-    "Default stance: be genuinely curious and specific to the user's situation—ask focused, non-generic questions that help get to the root of what’s going on. "
+    "Default stance: be genuinely curious and specific to the user's situation—ask focused, non-generic questions that help get to the root. "
     "Keep 2–3 sentences by default (up to 5 if the user shares details). "
-    "Use one of these styles per turn (don’t stack them back-to-back): "
-    "• Inquire: reflect briefly, then ask 1 precise question that narrows the real issue. "
-    "• Tip (sometimes): one tailored, concrete suggestion tied to what they said. "
-    "• Story (rarely): a very short vignette to normalize, then invite them back. "
-    "Avoid platitudes; vary wording. Avoid the phrases “I’m here with you” and “Let’s take it one step at a time.” "
-    "Crisis: if imminent self-harm, advise 911 and 988 immediately."
+    "Use exactly one style per turn (don’t stack): "
+    "• Inquire: brief reflection tied to their words, then 1 precise question that narrows the real issue. "
+    "• Tip (sometimes): offer ONE tailored, bite-sized suggestion tied to what they said (no menus). "
+    "• Story (rarely): a very short, relatable vignette; then invite them back. "
+    "Avoid generic platitudes. Vary wording. "
+    "Avoid the phrases “I’m here with you”, “Let’s take it one step at a time”, “let’s zero in”, and “quick gut check”. "
+    "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S.) immediately."
 )
 
-CRISIS_TRIGGERS = ("kill myself","suicide","hurt myself","harm myself","overdose","end my life","take my life","self harm","self-harm")
-STOP_WORDS      = ("stop","quit","end","goodbye","end call","terminate")
+CRISIS_TRIGGERS = (
+    "kill myself","suicide","hurt myself","harm myself","overdose",
+    "end my life","take my life","self harm","self-harm"
+)
+STOP_WORDS = ("stop","quit","end","goodbye","end call","terminate")
 
-# ========= Text helpers =========
+# ========= Helpers =========
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -88,7 +84,8 @@ def concise(text: str, max_chars: int = 520, max_sents: int = 5) -> str:
     sents = re.split(r"(?<=[.!?])\s+", t)
     t = " ".join(sents[:max_sents]).strip()
     if len(t) > max_chars:
-        t = re.sub(r"\s+\S*$", "", t[:max_chars]).rstrip(",;:.!? ")
+        t = t[:max_chars].rstrip()
+        t = re.sub(r"\s+\S*$", "", t).rstrip(",;:.!? ")
     return t
 
 def jaccard(a: set, b: set) -> float:
@@ -107,7 +104,12 @@ def too_similar(new: str, refs: list[str], threshold: float = 0.90) -> bool:
             return True
     return False
 
-BANNED_PREFIXES = ("i’m here with you", "let’s take it one step at a time")
+BANNED_PREFIXES = (
+    "i’m here with you", "i'm here with you",
+    "let’s take it one step at a time", "let's take it one step at a time",
+    "let’s zero in", "let's zero in",
+    "quick gut check"
+)
 
 def not_duplicate_user(text: str) -> bool:
     hist = sget("history", [])
@@ -115,8 +117,14 @@ def not_duplicate_user(text: str) -> bool:
     last = hist[-1]
     return not (last[0] == "user" and norm(last[1]) == norm(text))
 
-def not_duplicate_bot(text: str) -> bool:
-    return norm(sget("LAST_REPLY", "")) != norm(text)
+def not_duplicate_bot(reply_text: str, user_text_now: str) -> bool:
+    """
+    De-dupe ONLY if both the assistant text and the triggering user text
+    are identical to the previous turn. Otherwise allow the reply.
+    """
+    last_reply = norm(sget("LAST_REPLY", ""))
+    last_user  = norm(sget("LAST_USER_TEXT", ""))
+    return not (norm(reply_text) == last_reply and norm(user_text_now) == last_user)
 
 def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
@@ -129,7 +137,7 @@ def choose_style() -> str:
         weights = {"inquire": 0.75, "tip": 0.18, "story": 0.07}
     r = random.random()
     if r < weights["inquire"]: return "inquire"
-    elif r < weights["inquire"] + weights["tip"]: return "tip"
+    if r < weights["inquire"] + weights["tip"]: return "tip"
     return "story"
 
 # ========= OpenAI Chat =========
@@ -137,11 +145,24 @@ def openai_chat(messages, model=OPENAI_MODEL, temperature=0.55, max_tokens=360):
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+    r = http.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
     if r.status_code >= 400:
         raise RuntimeError(f"OpenAI HTTP {r.status_code}: {r.text[:200]}")
     data = r.json()
     return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+
+FALLBACKS = [
+    "What part of that feels most important to talk through first?",
+    "If you zoom into the exact moment it spiked, what had just happened?",
+    "What’s the one question you wish you had a clear answer to right now?",
+    "What would feel like a small next step that doesn’t make things worse?"
+]
+
+def safe_fallback():
+    last = norm(sget("LAST_REPLY", ""))
+    opts = [f for f in FALLBACKS if norm(f) not in BANNED_PREFIXES and norm(f) != last]
+    random.shuffle(opts)
+    return opts[0] if opts else "What feels most useful to focus on right now?"
 
 def llm_reply(user_text: str) -> tuple[str, str]:
     hist = sget("history", [])
@@ -150,48 +171,54 @@ def llm_reply(user_text: str) -> tuple[str, str]:
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": user_text})
 
-    # style steer
     style = choose_style()
     if style == "inquire":
-        msgs.append({"role": "system", "content":
-            "For THIS reply: Inquire. Short reflection tied to their words, "
-            "then ONE precise question. No exercises this turn."})
+        msgs.append({"role": "system", "content": (
+            "For THIS reply: Use the Inquire style. Brief reflection tied to their words, "
+            "then ONE precise, non-generic question to narrow the real issue. No lists."
+        )})
     elif style == "tip":
-        msgs.append({"role": "system", "content":
-            "For THIS reply: Tip. ONE tiny, tailored suggestion tied to what they said. "
-            "Optionally 1 short follow-up question."})
-    else:
-        msgs.append({"role": "system", "content":
-            "For THIS reply: Story. Very brief vignette to normalize, then invite them back. 2–3 sentences."})
+        msgs.append({"role": "system", "content": (
+            "For THIS reply: Tip style. Offer ONE tiny, tailored suggestion tied to what they said. "
+            "Optionally end with a short follow-up question."
+        )})
+    else:  # story
+        msgs.append({"role": "system", "content": (
+            "For THIS reply: Story style. Very brief, relatable vignette to normalize their experience, "
+            "then invite them back with a soft question (2–3 sentences total)."
+        )})
 
     dbg = "ok"
     try:
-        reply = openai_chat(msgs) or \
-                "Quick gut check: what part of this hits the hardest for you today? If it helps, name the exact moment it spikes."
+        reply = openai_chat(msgs) or safe_fallback()
     except Exception:
-        reply = "Let’s zero in: what was the moment today where this felt most intense—who was there and what changed right before it?"
+        reply = safe_fallback()
+
     final = concise(reply)
 
+    # Avoid too many question endings in a row
     recent_assist = sget("RECENT_ASSIST", [])
     recent_qs = sum(1 for r in recent_assist[-3:] if ends_with_question(r))
     if ends_with_question(final) and recent_qs >= 2:
-        msgs.append({"role": "system", "content": "Regenerate without ending in a question; keep it specific."})
+        msgs.append({"role": "system", "content": "Regenerate without ending in a question; keep it concrete and specific."})
         try:
             alt = openai_chat(msgs) or final
-            final = concise(alt); dbg = "regen_no_question"
+            final = concise(alt)
+            dbg = "regen_no_question"
         except Exception:
             pass
 
     low = norm(final)
-    if low.startswith(BANNED_PREFIXES) or too_similar(final, recent_assist):
-        msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user."})
+    if any(low.startswith(bp) for bp in BANNED_PREFIXES) or too_similar(final, recent_assist):
+        msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user's last message. Up to 5 sentences."})
         try:
             alt = openai_chat(msgs) or final
-            final = concise(alt); dbg = "regen_diversity"
+            final = concise(alt)
+            dbg = "regen_diversity"
         except Exception:
-            pass
+            dbg = "ok"
 
-    # record (per-user)
+    # Record per-user state
     append_capped_list("RECENT_STYLE", style, 4)
     append_capped_list("history", ("user", user_text), 16)
     append_capped_list("history", ("assistant", final), 16)
@@ -204,6 +231,7 @@ def tts_b64(text: str):
     safe_text = (text or "").strip()
     if not safe_text: return "", ""
     safe_text = safe_text[:650]
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {
@@ -212,9 +240,10 @@ def tts_b64(text: str):
         "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
         "output_format": "mp3_22050_64"
     }
+
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
         try:
-            r = session.post(url, headers=headers, json=payload, timeout=timeout)
+            r = http.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
                 if i < 2: time.sleep(0.15 * (i + 1)); continue
                 return "", f"TTS HTTP {r.status_code}: {r.text[:200]}"
@@ -225,26 +254,27 @@ def tts_b64(text: str):
             time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
-# ========= API: introduction (idempotent) =========
+# ========= API: introduction =========
 @app.post("/api/intro")
 def api_intro():
-    first_time = not sget("INTRO_SENT", False)
+    if sget("INTRO_SENT", False):
+        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_intro_blocked"}), 200
+
     intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
 
-    if first_time:
-        # reset per-user state
-        sset("history", []); sset("RECENT_ASSIST", []); sset("RECENT_STYLE", [])
-        sset("INTRO_SENT", True); sset("LAST_SPOKE", None); sset("LAST_REPLY", intro)
-        append_capped_list("RECENT_ASSIST", intro, 6)
-    else:
-        # already introduced: be idempotent (return same intro instead of error)
-        intro = sget("LAST_REPLY", intro)
+    # reset per-user state
+    sset("history", [])
+    sset("RECENT_ASSIST", [])
+    sset("RECENT_STYLE", [])
+    sset("INTRO_SENT", True)
+    sset("LAST_SPOKE", None)
+    sset("LAST_REPLY", intro)
+    sset("LAST_USER_TEXT", "")
+
+    append_capped_list("RECENT_ASSIST", intro, 6)
 
     audio, tts_err = tts_b64(intro)
-    return jsonify({
-        "reply": intro, "audio": audio, "tts_error": tts_err,
-        "dbg": "intro" if first_time else "intro_repeat"
-    }), 200
+    return jsonify({"reply": intro, "audio": audio, "tts_error": tts_err, "dbg": "intro"}), 200
 
 # ========= API: chat reply =========
 @app.post("/api/reply")
@@ -256,24 +286,32 @@ def api_reply():
 
     lower_text = norm(user_text)
 
-    # stop
+    # Stop command
     if contains_stop_command(lower_text):
-        sset("history", []); sset("RECENT_ASSIST", []); sset("RECENT_STYLE", [])
-        sset("INTRO_SENT", False); sset("LAST_SPOKE", None); sset("LAST_REPLY", "")
+        sset("history", [])
+        sset("RECENT_ASSIST", [])
+        sset("RECENT_STYLE", [])
+        sset("INTRO_SENT", False)
+        sset("LAST_SPOKE", None)
+        sset("LAST_REPLY", "")
+        sset("LAST_USER_TEXT", "")
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "stop_word"}), 200
 
-    # ignore client echo of bot line
+    # Ignore if client accidentally posts the bot's last reply
     if lower_text == norm(sget("LAST_REPLY", "")):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "echo_bot_line"}), 200
 
-    # mark that the last confirmed speaker is the user
+    if len(lower_text) < 1:
+        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "too_short"}), 200
+
+    # Mark last confirmed speaker as user
     sset("LAST_SPOKE", "user")
 
-    # avoid dup user lines
+    # prevent duplicate user messages
     if not not_duplicate_user(lower_text):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "duplicate_user"}), 200
 
-    # crisis fast-path
+    # Crisis path
     if detect_crisis(lower_text):
         reply = concise(
             "I’m really glad you told me. If you’re in immediate danger, call 911. "
@@ -284,16 +322,38 @@ def api_reply():
         append_capped_list("history", ("assistant", reply), 16)
         dbg = "crisis"
     else:
-        # NOTE: previously there was a server ‘double_speak_guard’. Removed so it can’t trip cross-user.
+        # With per-user state, this guard shouldn't misfire; keep as safety
+        if sget("LAST_SPOKE", "user") != "user":
+            return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_speak_guard"}), 200
+
         reply, dbg = llm_reply(user_text)
 
-    # de-dup exact bot line
-    if not not_duplicate_bot(reply):
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "dedup_bot"}), 200
+        # ----- SMART DEDUP FIX -----
+        if not not_duplicate_bot(reply, user_text):
+            # try once to regenerate with an explicit non-dup instruction
+            hist = sget("history", [])
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+            for role, content in hist[-12:]:
+                msgs.append({"role": role, "content": content})
+            msgs.extend([
+                {"role": "user", "content": user_text},
+                {"role": "system", "content": "Do NOT repeat your previous assistant reply verbatim; rephrase with different wording and detail."}
+            ])
+            try:
+                alt = openai_chat(msgs) or reply
+                alt = concise(alt)
+                # If still identical, allow it anyway to avoid silence
+                reply = alt
+                dbg = "regen_after_dedup"
+            except Exception:
+                # keep original reply rather than silencing
+                dbg = "dedup_allow"
 
+    # TTS + state update
     audio, tts_err = tts_b64(reply)
     sset("LAST_REPLY", reply)
-    # we rely on /api/ack_assistant from the client to set LAST_SPOKE="assistant"
+    sset("LAST_USER_TEXT", user_text)
+    sset("LAST_SPOKE", "assistant")
     return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
 
 # ========= API: assistant speech ACK =========
@@ -302,11 +362,16 @@ def api_ack_assistant():
     sset("LAST_SPOKE", "assistant")
     return jsonify({"ok": True})
 
-# ========= API: reset (per-user) =========
+# ========= API: reset memory =========
 @app.post("/api/reset")
 def api_reset():
-    sset("history", []); sset("RECENT_ASSIST", []); sset("RECENT_STYLE", [])
-    sset("INTRO_SENT", False); sset("LAST_SPOKE", None); sset("LAST_REPLY", "")
+    sset("history", [])
+    sset("RECENT_ASSIST", [])
+    sset("RECENT_STYLE", [])
+    sset("INTRO_SENT", False)
+    sset("LAST_SPOKE", None)
+    sset("LAST_REPLY", "")
+    sset("LAST_USER_TEXT", "")
     return jsonify({"ok": True})
 
 # ========= Health/ping =========
@@ -327,7 +392,7 @@ def index():
 <title>Tahlia – Voice Companion</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
-  :root { --bg:#0b0c10; --fg:#eaf2f8; --panel:#111417; --accent:green; --border:#1b1f24; }
+  :root { --bg:#0b0c10; --fg:#eaf2f8; --panel:#111417; --accent:pink; --border:#1b1f24; }
   * { box-sizing:border-box; }
   body { background:var(--bg); color:var(--fg); margin:0; font-family:system-ui, sans-serif; display:flex; height:100vh; width:100vw; overflow:hidden; }
 
@@ -345,7 +410,7 @@ def index():
   #modalClose { border:none; background:transparent; color:#cfd8e3; font-size:18px; cursor:pointer; padding:4px 8px; }
   #transcript { flex:1; overflow:auto; padding:10px; font-size:14px; line-height:1.35; }
   .line { padding:6px 8px; border-bottom:1px dashed #20242a; white-space:pre-wrap; word-break:break-word; }
-  .user { color:#c9f0ff; } .bot{ color:#d7ffe0; } .sys{ color:#ffd7d7; } .meta{ font-size:12px; color:#9aa4af; }
+  .user { color:#ffc9f0; } .bot{ color:#d7ffe0; } .sys{ color:#ffd7d7; } .meta{ font-size:12px; color:#9aa4af; }
 
   #player { display:none; }
 </style>
@@ -402,15 +467,15 @@ let lastBotReply = "";
 let introPlayed = false;
 
 let asrState = "idle";
-let recIsStarting = false;
 let lastASRStartTs = 0;
 let asrWatchdog = null;
 
 let assistantSpeaking = false;
 let wantsInterrupt = false;
 let botSpeakingSince = 0;
-const INTERRUPT_GRACE_MS = 700;
+const INTERRUPT_GRACE_MS = 800;   // slightly longer = fewer accidental interrupts
 let lastSendTs = 0;
+const SEND_DEBOUNCE_MS = 280;     // a bit slower to prevent rapid-fire empties
 const ECHO_WINDOW_MS = 1800;
 
 let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null;
@@ -428,7 +493,9 @@ function setupAudioAnalyzer(){
     mediaSrc.connect(analyser);
     mediaSrc.connect(audioCtx.destination);
     animateBall();
-  } catch(e){ logErr("Audio analyzer init failed: " + e); }
+  } catch(e){
+    logErr("Audio analyzer init failed: " + e);
+  }
 }
 
 function animateBall(){
@@ -471,11 +538,13 @@ function likelyEcho(userFinal, botLine){
 async function startASRSafe(delay = 0) {
   if (!rec || !session) return;
   if (asrState === "running" || asrState === "starting") return;
-  asrState = "starting"; recIsStarting = true;
+  asrState = "starting";
   try {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try { rec.start(); } catch(_) {}
-  } finally { setTimeout(() => { recIsStarting = false; }, 120); }
+    lastASRStartTs = Date.now();
+    logMeta("ASR start requested");
+  } finally {}
 }
 function stopASRSafe() {
   if (!rec) return;
@@ -492,32 +561,44 @@ function ensureASR(){
   rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
 
   rec.onstart = () => { asrState = "running"; lastASRStartTs = Date.now(); logMeta("ASR started"); };
-  rec.onend   = () => { if (!session) { asrState = "idle"; return; } asrState = "idle"; logMeta("ASR ended → restarting"); startASRSafe(250); };
-  rec.onerror = (e) => { if (!session) return; asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " → restarting"); setTimeout(() => startASRSafe(200), 300); };
+  rec.onend   = () => {
+    if (!session) { asrState = "idle"; return; }
+    asrState = "idle"; logMeta("ASR ended → restarting"); startASRSafe(300);
+  };
+  rec.onerror = (e) => {
+    if (!session) return;
+    asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " → restarting");
+    setTimeout(() => startASRSafe(300), 400);
+  };
 
   rec.onresult = (evt) => {
     let finalText = "";
     const now = Date.now();
+
     for (let i = evt.resultIndex; i < evt.results.length; i++) {
       const res = evt.results[i];
       const txt = (res[0]?.transcript || "").trim();
       if (!res.isFinal && txt) {
         const elapsed = now - botSpeakingSince;
-        if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
+        if (assistantSpeaking && botSpeakingSince && elapsed > INTERRUPT_GRACE_MS) wantsInterrupt = true;
       }
       if (res.isFinal) finalText += txt + " ";
     }
+
     finalText = (finalText || "").trim();
     if (!finalText) return;
+
     if (likelyEcho(finalText, lastBotReply)) { logMeta("Echo filtered"); return; }
     if (assistantSpeaking && !wantsInterrupt) return;
     if (assistantSpeaking && wantsInterrupt) { stopBotAudio(); wantsInterrupt = false; }
+
     if (finalText.length < 1) return;
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
-    if (now2 - lastSendTs < 220) return;
+    if (now2 - lastSendTs < SEND_DEBOUNCE_MS) return;
     lastSendTs = now2;
+
     logUser(finalText);
     sendToBot(finalText);
   };
@@ -525,11 +606,11 @@ function ensureASR(){
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
-    const tooLongSinceStart = Date.now() - lastASRStartTs > 12000;
+    const tooLongSinceStart = Date.now() - lastASRStartTs > 15000;
     if ((asrState !== "running" && asrState !== "starting") || tooLongSinceStart) {
       logMeta("ASR watchdog kick"); startASRSafe();
     }
-  }, 6000);
+  }, 7000);
 
   return rec;
 }
@@ -541,11 +622,13 @@ async function safeJson(resp){
 
 function stopBotAudio(){
   try { player.pause(); player.src = ""; player.currentTime = 0; } catch(_) {}
-  assistantSpeaking = false; botSpeakingSince = 0;
+  assistantSpeaking = false;
+  botSpeakingSince = 0;
 }
 
 async function sendToBot(text){
   const lw = (text || "").trim().toLowerCase();
+
   if (["stop","quit","end","goodbye","end call","terminate"].includes(lw) ||
       (lw.length <= 24 && ["stop","quit","end","goodbye","end call","terminate"].some(k => lw.includes(k)))) {
     session = false; introPlayed = false;
@@ -553,7 +636,11 @@ async function sendToBot(text){
     if (asrWatchdog) { clearInterval(asrWatchdog); asrWatchdog = null; }
     stopBotAudio();
     startBtn.textContent = "Start Conversation";
-    try { await fetch("/api/reply", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) }); } catch(_){}
+    try {
+      const r = await fetch("/api/reply", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
+      const d = await safeJson(r);
+      if (d.dbg) logMeta("Server: " + d.dbg); if (d.tts_error) logErr("TTS: " + d.tts_error);
+    } catch(e){ logErr("Stop send failed: " + e); }
     return;
   }
 
@@ -565,6 +652,7 @@ async function sendToBot(text){
       body: JSON.stringify({ text })
     });
     const d = await safeJson(r);
+
     if (d.dbg) logMeta("Server: " + d.dbg);
     if (d.error_text) logErr("Server raw: " + d.error_text);
     if (d.tts_error) logErr("TTS: " + d.tts_error);
@@ -582,32 +670,34 @@ async function sendToBot(text){
         fetch("/api/ack_assistant", { method:"POST" }).catch(()=>{});
       } catch(e){ logErr("Audio play failed: " + e); }
     }
-  } catch(e){ logErr("Fetch /api/reply failed: " + e); }
+  } catch(e){
+    logErr("Fetch /api/reply failed: " + e);
+  }
 }
 
 player.onpause = () => { assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; };
 player.onended = () => { assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; };
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && session) startASRSafe(120);
+  if (document.visibilityState === "visible" && session) startASRSafe(150);
 });
 if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
   navigator.mediaDevices.addEventListener("devicechange", () => {
-    if (session) startASRSafe(180);
+    if (session) startASRSafe(200);
   });
 }
-
-logsBtn.onclick = openModal;
 
 startBtn.onclick = async () => {
   if (!session) {
     try {
-      await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
     } catch(e) { alert("Microphone permission required"); return; }
 
     const r = ensureASR(); if (!r) return;
     session = true; startBtn.textContent = "■ End Conversation";
-    await startASRSafe(80);
+    await startASRSafe(100);
 
     try {
       if (!introPlayed) {
@@ -646,5 +736,4 @@ startBtn.onclick = async () => {
 # ========= Run (Render-compatible) =========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))  # Render sets PORT
-    # NOTE: debug=True shows PIN in logs; set to False in production if you prefer.
     app.run(host="0.0.0.0", port=port, debug=True)
