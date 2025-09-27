@@ -11,8 +11,7 @@
 
 import base64, re, time, random
 from collections import deque
-from flask import Flask, request, jsonify, make_response, redirect, url_for
-from flask import session as flask_session  # avoid clashing with requests.Session below
+from flask import Flask, request, jsonify, make_response
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -37,9 +36,6 @@ DEFAULT_TIMEOUT = (5, 55)
 
 # ========= Flask + short memory =========
 app = Flask(__name__)
-app.secret_key = "change_this_secret"  # replace with a random string or env var in production
-PASSWORD = "HAPPY"  # simple password gate
-
 history = deque(maxlen=16)
 
 # ---- session state flags (server) ----
@@ -48,59 +44,6 @@ LAST_SPOKE  = None           # "user" | "assistant" | None
 LAST_REPLY  = ""             # last assistant text (to block dupes)
 RECENT_ASSIST = deque(maxlen=6)
 RECENT_STYLE  = deque(maxlen=4)   # tracks 'inquire' | 'tip' | 'story'
-
-# ========= Password protection =========
-ALLOWED_PUBLIC_PATHS = {"/login", "/favicon.ico"}
-
-@app.before_request
-def require_login():
-    p = request.path or "/"
-    # allow login page and favicon without auth
-    if p in ALLOWED_PUBLIC_PATHS:
-        return
-    # allow static if you ever add it
-    if p.startswith("/static/"):
-        return
-    # require session for everything else (UI + APIs)
-    if not flask_session.get("logged_in"):
-        return redirect(url_for("login"))
-
-@app.get("/login")
-def login():
-    return """
-<!doctype html><html><head><meta charset="utf-8"/>
-<title>Login — Tahlia</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>
-  body { background:#0b0c10; color:#eaf2f8; margin:0; height:100vh; display:flex; align-items:center; justify-content:center; font-family:system-ui,sans-serif; }
-  .card { width:320px; background:#111417; border:1px solid #1b1f24; border-radius:12px; padding:22px; }
-  h2 { margin:0 0 10px 0; font-size:18px; }
-  input { width:100%; padding:10px; border-radius:8px; border:1px solid #24303a; background:#0d1117; color:#eaf2f8; }
-  button { width:100%; margin-top:10px; padding:10px; border:none; border-radius:8px; background:#5b5bd6; color:white; font-weight:700; cursor:pointer; }
-  .err  { color:#ffd7d7; font-size:13px; margin-bottom:8px; }
-</style>
-</head>
-<body>
-  <form class="card" method="post" action="/login">
-    <h2>Enter password</h2>
-    <input name="password" type="password" placeholder="Password" autofocus required/>
-    <button type="submit">Unlock</button>
-  </form>
-</body></html>
-"""
-
-@app.post("/login")
-def do_login():
-    pw = (request.form.get("password") or "").trim() if hasattr(str, "trim") else (request.form.get("password") or "").strip()
-    if pw == PASSWORD:
-        flask_session["logged_in"] = True
-        return redirect(url_for("index"))
-    return "<p style='color:#ffd7d7;font-family:sans-serif;'>Wrong password. <a href='/login'>Try again</a></p>", 403
-
-@app.get("/logout")
-def logout():
-    flask_session.clear()
-    return redirect(url_for("login"))
 
 # ========= Prompts and rules (curious, user-specific) =========
 SYSTEM_PROMPT = (
@@ -277,7 +220,7 @@ def tts_b64(text: str):
 
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
         try:
-            r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+            r = session.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
                 if i < 2: time.sleep(0.15 * (i + 1)); continue
                 return "", f"TTS HTTP {r.status_code}: {r.text[:200]}"
@@ -595,7 +538,7 @@ function ensureASR(){
 
       if (!res.isFinal && txt) {
         const elapsed = now - botSpeakingSince;
-        if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
+        if (assistantSpeaking && botSpeakingSince && elapsed > INTERRUPT_GRACE_MS) wantsInterrupt = true;
       }
 
       if (res.isFinal) finalText += txt + " ";
@@ -608,18 +551,18 @@ function ensureASR(){
     if (assistantSpeaking && !wantsInterrupt) return;
     if (assistantSpeaking && wantsInterrupt) { stopBotAudio(); wantsInterrupt = false; }
 
-    if (finalText.length < 1) return;
+    if (finalText.length < MIN_FINAL_LEN) return;
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
-    if (now2 - lastSendTs < 220) return;  # faster debounce
+    if (now2 - lastSendTs < 220) return;  // faster debounce
     lastSendTs = now2;
 
     logUser(finalText);
     sendToBot(finalText);
   };
 
-  # Watchdog: every 6s
+  // Watchdog: every 6s
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
