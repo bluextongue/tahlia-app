@@ -1,18 +1,16 @@
 # app.py
-# Minimal Flask Voice Bot (OpenAI + ElevenLabs)
+# Minimal Flask Chat + Voice (OpenAI + ElevenLabs) for Render
 # - Hardwired keys (as requested)
 # - Simple UI: Start/Stop, transcript, audio playback
 # - Chrome SpeechRecognition (final results only)
 # - Render-friendly (binds 0.0.0.0, PORT default 5050)
+# - /api/test_openai to validate connectivity on Render
 
 import os
 import base64
 import re
 import time
-from collections import deque
-
 from flask import Flask, request, jsonify, make_response
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -42,7 +40,7 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# Slightly larger timeouts for hosted envs
+# Larger timeouts for hosted envs
 DEFAULT_TIMEOUT = (10, 120)
 
 # ========= Flask app =========
@@ -66,6 +64,7 @@ def concise(text, max_chars=520, max_sents=5):
     return t
 
 def openai_chat(user_text: str) -> str:
+    # Call Chat Completions
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": "Bearer " + OPENAI_API_KEY, "Content-Type": "application/json"}
     messages = [
@@ -75,9 +74,10 @@ def openai_chat(user_text: str) -> str:
     payload = {"model": OPENAI_MODEL, "messages": messages, "temperature": 0.6, "max_tokens": 320}
     r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
     if r.status_code >= 400:
+        # Include a short snippet so it's visible in /api/reply debug
         raise RuntimeError(f"OpenAI HTTP {r.status_code}: {r.text[:200]}")
     data = r.json()
-    reply = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    reply = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
     return concise(reply)
 
 def tts_b64(text: str):
@@ -111,23 +111,49 @@ def tts_b64(text: str):
             time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
-# ========= API =========
+# ========= API: OpenAI connectivity quick test =========
+@app.get("/api/test_openai")
+def api_test_openai():
+    try:
+        url = "https://api.openai.com/v1/models"
+        headers = {"Authorization": "Bearer " + OPENAI_API_KEY}
+        r = session.get(url, headers=headers, timeout=(10, 30))
+        ok = 200 <= r.status_code < 300
+        return jsonify({
+            "ok": ok,
+            "status": r.status_code,
+            "body_head": (r.text or "")[:200]
+        }), (200 if ok else 500)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+# ========= API: chat =========
 @app.post("/api/reply")
 def api_reply():
     data = request.get_json(force=True, silent=False) or {}
     user_text = (data.get("text") or "").strip()
     if not user_text:
-        return jsonify({"reply": "", "audio": "", "err": "empty_text"}), 400
+        return jsonify({"reply": "", "audio": "", "err": "empty_text", "dbg": {"why": "no_user_text"}}), 400
+
+    dbg = {"openai": "ok"}
     try:
         reply = openai_chat(user_text)
+        if not reply:
+            reply = "Try a tiny step: inhale for 4, exhale for 6, three rounds. Then jot one smallest next action."
+            dbg["openai"] = "empty_reply_fallback"
     except Exception as e:
         reply = (
-            "Quick grounding: inhale for 4, exhale for 6, for 4 rounds. "
+            "Quick grounding: inhale 4 / exhale 6 for 4 rounds. "
             "Then name one tiny next step that reduces friction by 5%."
         )
-    audio, tts_err = tts_b64(reply)
-    return jsonify({"reply": reply, "audio": audio, "err": tts_err or ""}), 200
+        dbg["openai"] = f"error: {str(e)[:200]}"
 
+    audio, tts_err = tts_b64(reply)
+    if tts_err:
+        dbg["tts"] = tts_err
+    return jsonify({"reply": reply, "audio": audio, "err": tts_err or "", "dbg": dbg}), 200
+
+# ========= UI =========
 @app.get("/")
 def index():
     html = """
@@ -135,7 +161,7 @@ def index():
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Tahlia - Minimal Voice Bot</title>
+  <title>Tahlia - Minimal Chat & Voice</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     :root { --bg:#0b0c10; --fg:#eaf2f8; --panel:#111417; --accent:#5b5bd6; --border:#1b1f24; }
@@ -147,17 +173,21 @@ def index():
     button { padding:12px 16px; border:none; border-radius:10px; background:#1a1f24; color:#fff; font-weight:600; cursor:pointer; }
     button[disabled] { opacity:.6; cursor:not-allowed; }
     #status { font-size:13px; color:#9aa4af; }
-    #log { margin-top:16px; padding:12px; background:var(--panel); border:1px solid var(--border); border-radius:10px; min-height:160px; white-space:pre-wrap; }
+    #log { margin-top:16px; padding:12px; background:var(--panel); border:1px solid var(--border); border-radius:10px; min-height:200px; white-space:pre-wrap; }
     #player { display:none; }
+    .info { font-size:13px; color:#9aa4af; margin-top:10px; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Tahlia - Minimal Voice Bot</h1>
+    <h1>Tahlia - Minimal Chat & Voice</h1>
     <div class="row">
       <button id="startBtn">Start</button>
       <button id="stopBtn" disabled>Stop</button>
       <span id="status">idle</span>
+    </div>
+    <div class="info">
+      Tip: On Render, open <code>/api/test_openai</code> to verify connectivity.
     </div>
     <div id="log"></div>
     <audio id="player" autoplay></audio>
@@ -226,6 +256,7 @@ def index():
         body: JSON.stringify({ text })
       });
       const d = await r.json();
+      if (d.dbg) { try { log("DBG: " + JSON.stringify(d.dbg)); } catch(_) {} }
       if (d.err) log("Note: " + d.err);
       if (d.reply) log("Tahlia: " + d.reply);
       if (d.audio) {
