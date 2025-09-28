@@ -21,14 +21,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ========= YOUR API KEYS (LOCAL ONLY) =========
-ELEVEN_API_KEY = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
-ELEVEN_VOICE_ID = "XeomjLZoU5rr4yNIg16w"
+# ========= API KEYS (use env vars; works locally & on Render) =========
+ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY", "")
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID") or os.environ.get("ELEVENLABS_VOICE_ID", "XeomjLZoU5rr4yNIg16w")
 
-OPENAI_API_KEY = "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"
-OPENAI_MODEL = "gpt-4o-mini"  # try "o4-mini" or "o4" for smarter
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # try "o4-mini" or "o4" for smarter
 
-ASSISTANT_NAME = "Tahlia"
+ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "Tahlia")
 
 # ========= HTTP session with retries =========
 session = requests.Session()
@@ -184,12 +184,17 @@ def llm_reply(user_text: str) -> tuple[str, str]:
         try:
             out = openai_chat(messages, temperature=temp, max_tokens=max_tokens)
             if not out:
-                return ("Here's one simple thing to try: name what feels most present right now in one word, "
-                        "then take a slow 4-count inhale and 6-count exhale. What feels even 5% lighter?")
+                return (
+                    "Here's one simple thing to try: name what feels most present right now in one word, "
+                    "then take a slow 4-count inhale and 6-count exhale. What feels even 5% lighter?"
+                )
             return out
         except Exception:
-            return ("Here's something concrete to try right now: put a 2-minute timer and write the one problem "
-                    in a single sentence, then underline the part you can influence today. What's the tiniest next step?")
+            # FIX: proper joined string (the previous version missed quotes on the second line)
+            return (
+                "Here's something concrete to try right now: put a 2-minute timer and write the one problem "
+                "in a single sentence, then underline the part you can influence today. What's the tiniest next step?"
+            )
 
     dbg = "ok"
     reply = concise(sample(msgs))
