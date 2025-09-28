@@ -1,17 +1,16 @@
 # app.py
-# Tahlia: Flask + OpenAI + ElevenLabs
-# - Curious-by-default vibe: user-specific questions; occasional tailored tip; rare short vignette
-# - Single-intro, no double-speak (server + client ack)
+# Tahlia: Flask + Google Gemini (2.0 Flash) + ElevenLabs (per-user session state)
+# - Per-client (cid) memory so intro/dedup/double-speak are isolated per user
 # - Always-on ASR with final-only interrupt + echo filter
-# - Faster feel: lower interrupt grace (700ms), quicker ASR send (220ms), smaller TTS
-# - Allows deeper responses when appropriate (up to 5 sentences)
-# - Transcript/logs: modal panel (button opens, "X" closes; starts closed)
-# - Voice-reactive ball: scales with assistant audio volume (and stays audible)
-# - Default port 5050
+# - Faster feel: lower interrupt grace (700ms), quick send debounce (220ms)
+# - Robust LLM error logging + safe fallback that avoids duplicate blocking
+# - Modal/backdrop fix + button click fixes
 
-import base64, re, time, random
-from collections import deque
-from flask import Flask, request, jsonify, make_response
+import base64, re, time, random, os, threading, json, sys
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from flask import Flask, request, jsonify, make_response, send_file
+from io import BytesIO
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,8 +20,9 @@ from urllib3.util.retry import Retry
 ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
 ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
 
-OPENAI_API_KEY  = "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"
-OPENAI_MODEL    = "gpt-4o-mini"  # try "o4-mini" or "o4" for smarter
+# Google Gemini API (AI Studio)
+GOOGLE_API_KEY  = "AIzaSyBqKNG0-SEQapQBtZaHa_YdiabBfm_ADLY"
+GEMINI_MODEL    = "gemini-2.0-flash"   # working on v1beta generateContent
 
 ASSISTANT_NAME  = "Tahlia"
 
@@ -34,18 +34,33 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 DEFAULT_TIMEOUT = (5, 55)
 
-# ========= Flask + short memory =========
+# ========= Flask =========
 app = Flask(__name__)
-history = deque(maxlen=16)
 
-# ---- session state flags (server) ----
-INTRO_SENT  = False
-LAST_SPOKE  = None           # "user" | "assistant" | None
-LAST_REPLY  = ""             # last assistant text (to block dupes)
-RECENT_ASSIST = deque(maxlen=6)
-RECENT_STYLE  = deque(maxlen=4)   # tracks 'inquire' | 'tip' | 'story'
+# ========= Per-client state =========
+@dataclass
+class ClientState:
+    history: deque = field(default_factory=lambda: deque(maxlen=16))
+    intro_sent: bool = False
+    last_spoke: str | None = None
+    last_reply: str = ""
+    recent_assist: deque = field(default_factory=lambda: deque(maxlen=6))
+    recent_style: deque = field(default_factory=lambda: deque(maxlen=4))
 
-# ========= Prompts and rules (curious, user-specific) =========
+state_lock = threading.Lock()
+clients: dict[str, ClientState] = defaultdict(ClientState)
+
+def get_state(cid: str) -> ClientState:
+    if not cid:
+        cid = "anon"
+    with state_lock:
+        return clients[cid]
+
+def reset_state(cid: str):
+    with state_lock:
+        clients[cid] = ClientState()
+
+# ========= Prompts and rules =========
 SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, a warm, natural, therapist-like conversational partner. "
     "Default stance: be genuinely curious and specific to the user's situation—ask focused, non-generic questions that help get to the root of what’s going on. "
@@ -53,10 +68,8 @@ SYSTEM_PROMPT = (
     "Use one of these styles per turn (don’t stack them back-to-back): "
     "• Inquire: reflect briefly, then ask 1 precise question that narrows the real issue (e.g., where/when/who/what made it harder). "
     "• Tip (sometimes): offer a tailored, bite-sized suggestion tied to what the user said—no menus of exercises, just one concrete move. "
-    "• Story (rarely): share a very short, relatable vignette ('some people find…') to normalize or illustrate, then leave space for them. "
-    "Avoid generic platitudes and generic 'how are you coping' unless the user invites it. "
-    "Vary your wording; avoid repeating lines. "
-    "Avoid the phrases “I’m here with you” and “Let’s take it one step at a time.” "
+    "• Story (rarely): share a very short, relatable vignette ('some people find…') to normalize their experience, then invite them back. "
+    "Avoid generic platitudes and the phrases “I’m here with you” and “Let’s take it one step at a time.” "
     "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately."
 )
 
@@ -103,23 +116,19 @@ def too_similar(new: str, refs: list[str], threshold: float = 0.90) -> bool:
 
 BANNED_PREFIXES = ("i’m here with you", "let’s take it one step at a time")
 
-def not_duplicate_user(text: str) -> bool:
-    if not history: return True
-    last = history[-1]
+def not_duplicate_user(st: ClientState, text: str) -> bool:
+    if not st.history: return True
+    last = st.history[-1]
     return not (last[0] == "user" and norm(last[1]) == norm(text))
 
-def not_duplicate_bot(text: str) -> bool:
-    return norm(LAST_REPLY) != norm(text)
+def not_duplicate_bot(st: ClientState, text: str) -> bool:
+    return norm(st.last_reply) != norm(text)
 
 def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
 
-def choose_style() -> str:
-    """
-    Bias toward 'inquire' (curious, specific), sometimes 'tip', rarely 'story'.
-    Avoid repeating non-inquire styles back-to-back.
-    """
-    last = RECENT_STYLE[-1] if RECENT_STYLE else None
+def choose_style(st: ClientState) -> str:
+    last = st.recent_style[-1] if st.recent_style else None
     weights = {"inquire": 0.60, "tip": 0.30, "story": 0.10}
     if last in ("tip", "story"):
         weights = {"inquire": 0.75, "tip": 0.18, "story": 0.07}
@@ -130,25 +139,65 @@ def choose_style() -> str:
         return "tip"
     return "story"
 
-# ========= OpenAI Chat =========
-def openai_chat(messages, model=OPENAI_MODEL, temperature=0.55, max_tokens=360):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
-    if r.status_code >= 400:
-        raise RuntimeError(f"OpenAI HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+# ========= Google Gemini Chat =========
+def _to_gemini_contents(messages):
+    contents = []
+    for m in messages:
+        role = m.get("role", "user")
+        text = m.get("content", "") or ""
+        if role == "system":
+            role = "user"
+            text = f"[SYSTEM INSTRUCTIONS]\n{text}"
+        elif role == "assistant":
+            role = "model"
+        else:
+            role = "user"
+        contents.append({"role": role, "parts": [{"text": text}]})
+    return contents
 
-def llm_reply(user_text: str) -> tuple[str, str]:
+def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GOOGLE_API_KEY}"
+    payload = {
+        "contents": _to_gemini_contents(messages),
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_tokens),
+            "topP": 0.9,
+            "topK": 40
+        }
+        # safetySettings intentionally omitted (defaults apply)
+    }
+    headers = {"Content-Type": "application/json"}
+    r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+    if r.status_code >= 400:
+        sys.stderr.write(f"\n[GEMINI HTTP {r.status_code}] {r.text[:500]}\n")
+        raise RuntimeError(f"Gemini HTTP {r.status_code}")
+
+    data = r.json() or {}
+    cands = data.get("candidates") or []
+    if not cands:
+        # log prompt feedback for debugging
+        pf = data.get("promptFeedback")
+        sys.stderr.write(f"\n[GEMINI EMPTY] feedback={json.dumps(pf)[:500]} raw={json.dumps(data)[:500]}\n")
+        return "", "empty"
+
+    first = cands[0]
+    parts = ((first.get("content") or {}).get("parts") or [])
+    text = (parts[0].get("text") if parts else "") or ""
+    if not text.strip():
+        safety = first.get("safetyRatings") or []
+        sys.stderr.write(f"\n[GEMINI NO TEXT] safety={json.dumps(safety)[:500]} raw={json.dumps(first)[:500]}\n")
+        return "", "no_text"
+    return text.strip(), "ok"
+
+def llm_reply(st: ClientState, user_text: str) -> tuple[str, str]:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for role, content in list(history)[-12:]:
+    for role, content in list(st.history)[-12:]:
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": user_text})
 
-    # Style steering for THIS reply
-    style = choose_style()
+    style = choose_style(st)
     if style == "inquire":
         msgs.append({"role": "system", "content": (
             "For THIS reply: Use the Inquire style. Give a short reflection tied to their words, "
@@ -158,48 +207,50 @@ def llm_reply(user_text: str) -> tuple[str, str]:
     elif style == "tip":
         msgs.append({"role": "system", "content": (
             "For THIS reply: Use the Tip style. Offer ONE tailored, concrete suggestion tightly linked to what they said. "
-            "Keep it tiny and situational (no list, no menu of exercises). Optionally end with a short follow-up question."
+            "Keep it tiny and situational. Optionally end with a short follow-up question."
         )})
     else:  # story
         msgs.append({"role": "system", "content": (
             "For THIS reply: Use the Story style. Share a very brief, relatable vignette ('some people find…') "
-            "that normalizes their experience, then invite them back with a soft question or reflection. Keep it 2–3 sentences."
+            "that normalizes their experience, then invite them back. Keep it 2–3 sentences."
         )})
 
     dbg = "ok"
     try:
-        reply = openai_chat(msgs) or \
-                "Quick gut check: what part of this hits the hardest for you today? If it helps, name the exact moment it spikes."
-    except Exception:
-        reply = ("Let’s zero in: what was the moment today where this felt most intense—who was there and what changed right before it?")
-    final = concise(reply)
+        text, status = gemini_chat(msgs)
+        if not text:
+            dbg = f"llm_empty_{status}"
+            text = ("Got it—when does school feel toughest: during classes, homework load, or dealing with people there?")
+    except Exception as e:
+        dbg = "llm_error"
+        sys.stderr.write(f"\n[LLM ERROR] {e}\n")
+        text = ("Quick check-in: what part of school is spiking the stress most today—time pressure, a specific class, or something social?")
 
-    # Allow more inquisitiveness; only block if last TWO also ended with questions
-    recent_qs = sum(1 for r in list(RECENT_ASSIST)[-3:] if ends_with_question(r))
+    final = concise(text)
+
+    # Avoid 3 questions in a row
+    recent_qs = sum(1 for r in list(st.recent_assist)[-3:] if ends_with_question(r))
     if ends_with_question(final) and recent_qs >= 2:
         msgs.append({"role": "system", "content": "Regenerate without ending in a question. Keep it specific and user-focused."})
         try:
-            alt = openai_chat(msgs) or final
-            final = concise(alt)
-            dbg = "regen_no_question"
+            alt, _ = gemini_chat(msgs)
+            if alt: final = concise(alt); dbg = "regen_no_question"
         except Exception:
             pass
 
     low = norm(final)
-    if low.startswith(BANNED_PREFIXES) or too_similar(final, list(RECENT_ASSIST)):
+    if low.startswith(BANNED_PREFIXES) or too_similar(final, list(st.recent_assist)):
         msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user's last message. Allow up to 5 sentences if helpful."})
         try:
-            alt = openai_chat(msgs) or final
-            final = concise(alt)
-            dbg = "regen_diversity"
+            alt, _ = gemini_chat(msgs)
+            if alt: final = concise(alt); dbg = "regen_diversity"
         except Exception:
-            dbg = "ok"
+            pass
 
-    # Record chosen style and finalize
-    RECENT_STYLE.append(style)
-    history.append(("user", user_text))
-    history.append(("assistant", final))
-    RECENT_ASSIST.append(final)
+    st.recent_style.append(style)
+    st.history.append(("user", user_text))
+    st.history.append(("assistant", final))
+    st.recent_assist.append(final)
     return final, dbg
 
 # ========= ElevenLabs TTS =========
@@ -215,7 +266,7 @@ def tts_b64(text: str):
         "text": safe_text,
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
-        "output_format": "mp3_22050_64"  # smaller & faster than 44.1k/128
+        "output_format": "mp3_22050_64"
     }
 
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
@@ -234,94 +285,100 @@ def tts_b64(text: str):
 # ========= API: introduction =========
 @app.post("/api/intro")
 def api_intro():
-    global INTRO_SENT, LAST_SPOKE, LAST_REPLY, RECENT_ASSIST, RECENT_STYLE
-    if INTRO_SENT:
+    data = request.get_json(force=True, silent=False) or {}
+    cid = (data.get("cid") or "").strip()
+    st = get_state(cid)
+
+    if st.intro_sent:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_intro_blocked"}), 200
+
     intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
-    history.clear(); RECENT_ASSIST.clear(); RECENT_STYLE.clear()
-    INTRO_SENT = True
-    LAST_SPOKE = None
-    LAST_REPLY = intro
-    RECENT_ASSIST.append(intro)
+    reset_state(cid)
+    st = get_state(cid)
+    st.intro_sent = True
+    st.last_spoke = None
+    st.last_reply = intro
+    st.recent_assist.append(intro)
+
     audio, tts_err = tts_b64(intro)
     return jsonify({"reply": intro, "audio": audio, "tts_error": tts_err, "dbg": "intro"}), 200
 
 # ========= API: chat reply =========
 @app.post("/api/reply")
 def api_reply():
-    global INTRO_SENT, LAST_SPOKE, LAST_REPLY
     data = request.get_json(force=True, silent=False) or {}
+    cid = (data.get("cid") or "").strip()
+    st = get_state(cid)
+
     user_text = (data.get("text") or "").strip()
     if not user_text:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "empty_text"}), 400
 
     lower_text = norm(user_text)
 
-    # Stop command
     if contains_stop_command(lower_text):
-        history.clear()
-        INTRO_SENT = False
-        LAST_SPOKE = None
-        LAST_REPLY = ""
+        reset_state(cid)
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "stop_word"}), 200
 
-    # Ignore if client accidentally posts the bot's last reply
-    if lower_text == norm(LAST_REPLY):
+    if lower_text == norm(st.last_reply):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "echo_bot_line"}), 200
 
     if len(lower_text) < 1:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "too_short"}), 200
 
-    # Mark that the last confirmed speaker is the user
-    LAST_SPOKE = "user"
+    st.last_spoke = "user"
 
-    # prevent duplicate user messages
-    if not not_duplicate_user(lower_text):
+    if not not_duplicate_user(st, lower_text):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "duplicate_user"}), 200
 
-    # Crisis path
     if detect_crisis(lower_text):
         reply = concise(
             "I’m really glad you told me. If you’re in immediate danger, call 911. "
             "In the U.S., you can call or text 988 for the Suicide & Crisis Lifeline. "
             "Would you like resources now?"
         )
-        history.append(("user", user_text)); history.append(("assistant", reply))
+        st.history.append(("user", user_text)); st.history.append(("assistant", reply))
         dbg = "crisis"
     else:
-        if LAST_SPOKE != "user":
-            return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_speak_guard"}), 200
-        reply, dbg = llm_reply(user_text)
+        reply, dbg = llm_reply(st, user_text)
 
-    # Block exact duplicate bot lines
-    if not not_duplicate_bot(reply):
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "dedup_bot"}), 200
+    if not not_duplicate_bot(st, reply):
+        reply = reply.rstrip(".") + " — when did that start showing up for you?"
+        dbg = "dedup_softened"
 
     audio, tts_err = tts_b64(reply)
-    LAST_REPLY = reply
+    st.last_reply = reply
     return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
 
 # ========= API: assistant speech ACK =========
 @app.post("/api/ack_assistant")
 def api_ack_assistant():
-    global LAST_SPOKE
-    LAST_SPOKE = "assistant"
+    data = request.get_json(force=True, silent=False) or {}
+    cid = (data.get("cid") or "").strip()
+    st = get_state(cid)
+    st.last_spoke = "assistant"
     return jsonify({"ok": True})
 
 # ========= API: reset memory =========
 @app.post("/api/reset")
 def api_reset():
-    global INTRO_SENT, LAST_SPOKE, LAST_REPLY, RECENT_ASSIST, RECENT_STYLE
-    history.clear(); RECENT_ASSIST.clear(); RECENT_STYLE.clear()
-    INTRO_SENT = False
-    LAST_SPOKE = None
-    LAST_REPLY = ""
+    data = request.get_json(force=True, silent=False) or {}
+    cid = (data.get("cid") or "").strip()
+    reset_state(cid)
     return jsonify({"ok": True})
 
 # ========= Health/ping =========
 @app.get("/api/ping")
 def api_ping():
-    return jsonify({"ok": True, "ts": time.time(), "intro_sent": INTRO_SENT, "last_spoke": LAST_SPOKE})
+    cid = request.args.get("cid", "").strip()
+    st = get_state(cid) if cid else ClientState()
+    return jsonify({"ok": True, "ts": time.time(), "intro_sent": st.intro_sent, "last_spoke": st.last_spoke})
+
+# ========= Favicon =========
+@app.get("/favicon.ico")
+def favicon():
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82"
+    return send_file(BytesIO(png), mimetype="image/x-icon")
 
 # ========= UI (client) =========
 @app.get("/")
@@ -333,16 +390,18 @@ def index():
 <style>
   :root { --bg:#0b0c10; --fg:#eaf2f8; --panel:#111417; --accent:#5b5bd6; --border:#1b1f24; }
   * { box-sizing:border-box; }
-  body { background:var(--bg); color:var(--fg); margin:0; font-family:system-ui, sans-serif; display:flex; height:100vh; width:100vw; overflow:hidden; }
+  html, body { height:100%; }
+  body { background:var(--bg); color:var(--fg); margin:0; font-family:system-ui, sans-serif; display:flex; min-height:100vh; width:100vw; overflow:hidden; position:relative; }
 
-  /* Left column */
-  #left { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:24px; min-width:0; }
+  #left { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:24px; min-width:0; position:relative; z-index:1; }
   #ball { width:120px; height:120px; border-radius:50%; background:var(--accent); transition:transform 0.08s ease; box-shadow:0 10px 30px rgba(0,0,0,.3); }
-  #startBtn { padding:14px 20px; border:none; border-radius:12px; background:#161a1f; color:#fff; font-weight:600; font-size:16px; cursor:pointer; box-shadow:0 2px 10px rgba(0,0,0,.25); }
-  #logsBtn { padding:10px 14px; border:1px solid var(--border); border-radius:10px; background:#0e1116; color:#cfd8e3; font-weight:600; font-size:13px; cursor:pointer; }
+  button { cursor:pointer; }
+  #startBtn, #logsBtn { position:relative; z-index:2; }
+  #startBtn { padding:14px 20px; border:none; border-radius:12px; background:#161a1f; color:#fff; font-weight:600; font-size:16px; box-shadow:0 2px 10px rgba(0,0,0,.25); }
+  #logsBtn { padding:10px 14px; border:1px solid var(--border); border-radius:10px; background:#0e1116; color:#cfd8e3; font-weight:600; font-size:13px; }
 
-  /* Transcript modal */
-  #modalBackdrop { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; }
+  #modalBackdrop { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; pointer-events:none; align-items:center; justify-content:center; z-index:10; }
+  #modalBackdrop.show { display:flex; pointer-events:auto; }
   #modal { width:min(720px, 92vw); height:min(70vh, 86vh); background:var(--panel); border:1px solid var(--border); border-radius:12px; display:flex; flex-direction:column; overflow:hidden; }
   #modalHeader { display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border); background:#0e1116; }
   #modalTitle { font-size:14px; color:#9aa4af; }
@@ -351,31 +410,36 @@ def index():
   .line { padding:6px 8px; border-bottom:1px dashed #20242a; white-space:pre-wrap; word-break:break-word; }
   .user { color:#c9f0ff; } .bot{ color:#d7ffe0; } .sys{ color:#ffd7d7; } .meta{ font-size:12px; color:#9aa4af; }
 
-  /* Hidden default audio element */
-  #player { display:none; }
+  #player { position:absolute; width:0; height:0; opacity:0; pointer-events:none; }
 </style>
 </head>
 <body>
   <div id="left">
-    <div id="ball"></div>
-    <button id="startBtn">Start Conversation</button>
-    <button id="logsBtn">Transcript & Logs</button>
+    <div id="ball" aria-hidden="true"></div>
+    <button id="startBtn" type="button">Start Conversation</button>
+    <button id="logsBtn" type="button">Transcript & Logs</button>
     <audio id="player" autoplay></audio>
   </div>
 
-  <!-- Modal -->
-  <div id="modalBackdrop">
-    <div id="modal">
+  <div id="modalBackdrop" aria-hidden="true">
+    <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <div id="modalHeader">
         <div id="modalTitle">Transcript & Logs</div>
-        <button id="modalClose" title="Close">✕</button>
+        <button id="modalClose" type="button" title="Close">✕</button>
       </div>
       <div id="transcript"></div>
     </div>
   </div>
 
 <script>
-/* ---------- DOM ---------- */
+function uuidv4(){
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+  );
+}
+let clientId = localStorage.getItem("tahlia_cid");
+if (!clientId){ clientId = uuidv4(); localStorage.setItem("tahlia_cid", clientId); }
+
 const player = document.getElementById("player");
 const startBtn = document.getElementById("startBtn");
 const logsBtn = document.getElementById("logsBtn");
@@ -384,7 +448,6 @@ const modalBackdrop = document.getElementById("modalBackdrop");
 const modalClose = document.getElementById("modalClose");
 const transcriptEl = document.getElementById("transcript");
 
-/* ---------- Logs ---------- */
 function logLine(kind, text){
   const div = document.createElement("div");
   div.className = "line " + (kind || "meta");
@@ -397,26 +460,22 @@ function logBot(t){ logLine("bot",  "Tahlia: " + t); }
 function logErr(t){ logLine("sys",  "Error: " + t); }
 function logMeta(t){ logLine("meta", t); }
 
-/* ---------- Modal controls ---------- */
-function openModal(){ modalBackdrop.style.display = "flex"; }
-function closeModal(){ modalBackdrop.style.display = "none"; }
-logsBtn.onclick = openModal;
-modalClose.onclick = closeModal;
+function openModal(){ modalBackdrop.classList.add("show"); modalBackdrop.setAttribute("aria-hidden","false"); }
+function closeModal(){ modalBackdrop.classList.remove("show"); modalBackdrop.setAttribute("aria-hidden","true"); }
+logsBtn.addEventListener("click", openModal);
+modalClose.addEventListener("click", closeModal);
 modalBackdrop.addEventListener("click", (e) => { if (e.target === modalBackdrop) closeModal(); });
 
-/* ---------- State ---------- */
 let rec = null;
 let session = false;
 let lastBotReply = "";
 let introPlayed = false;
 
-/* ASR state machine */
-let asrState = "idle"; // "idle"|"starting"|"running"|"stopping"
+let asrState = "idle";
 let recIsStarting = false;
 let lastASRStartTs = 0;
 let asrWatchdog = null;
 
-/* Interrupt controls (final-only interrupt + echo filter) */
 let assistantSpeaking = false;
 let wantsInterrupt = false;
 let botSpeakingSince = 0;
@@ -425,9 +484,8 @@ const MIN_FINAL_LEN = 1;
 let lastSendTs = 0;
 const ECHO_WINDOW_MS = 1800;
 
-/* ---------- Voice-reactive ball (assistant audio only) ---------- */
 let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null;
-let volEMA = 0; // smoothed volume 0..1
+let volEMA = 0;
 
 function setupAudioAnalyzer(){
   if (audioCtx) return;
@@ -438,12 +496,8 @@ function setupAudioAnalyzer(){
     analyser.fftSize = 2048;
     const bufLen = analyser.frequencyBinCount;
     dataArray = new Uint8Array(bufLen);
-
-    // tap the signal for analysis…
     mediaSrc.connect(analyser);
-    // …and ALSO route the actual audio to the speakers (do NOT mute)
     mediaSrc.connect(audioCtx.destination);
-
     animateBall();
   } catch(e){
     logErr("Audio analyzer init failed: " + e);
@@ -458,17 +512,14 @@ function animateBall(){
     const v = (dataArray[i] - 128) / 128;
     sum += v * v;
   }
-  const rms = Math.sqrt(sum / dataArray.length); // ~0..1
+  const rms = Math.sqrt(sum / dataArray.length);
   const target = assistantSpeaking ? rms : 0;
   volEMA = volEMA * 0.85 + target * 0.15;
-
   const scale = 1 + Math.min(0.9, volEMA * 2.2);
   ball.style.transform = "scale(" + scale.toFixed(3) + ")";
-
   requestAnimationFrame(animateBall);
 }
 
-/* ---------- Utils ---------- */
 function words(str){
   return (str || "").toLowerCase().replace(/[^\\w\\s']/g, " ").split(/\\s+/).filter(Boolean);
 }
@@ -490,7 +541,6 @@ function likelyEcho(userFinal, botLine){
   return sim >= 0.6 || prefixish;
 }
 
-/* ---------- ASR control ---------- */
 async function startASRSafe(delay = 0) {
   if (!rec || !session) return;
   if (asrState === "running" || asrState === "starting") return;
@@ -498,7 +548,6 @@ async function startASRSafe(delay = 0) {
   try {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try { rec.start(); } catch(_) {}
-    console.debug("ASR start requested");
   } finally {
     setTimeout(() => { recIsStarting = false; }, 120);
   }
@@ -538,7 +587,7 @@ function ensureASR(){
 
       if (!res.isFinal && txt) {
         const elapsed = now - botSpeakingSince;
-        if (assistantSpeaking && botSpeakingSince && elapsed > INTERRUPT_GRACE_MS) wantsInterrupt = true;
+        if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
       }
 
       if (res.isFinal) finalText += txt + " ";
@@ -551,18 +600,17 @@ function ensureASR(){
     if (assistantSpeaking && !wantsInterrupt) return;
     if (assistantSpeaking && wantsInterrupt) { stopBotAudio(); wantsInterrupt = false; }
 
-    if (finalText.length < MIN_FINAL_LEN) return;
+    if (finalText.length < 1) return;
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
-    if (now2 - lastSendTs < 220) return;  // faster debounce
+    if (now2 - lastSendTs < 220) return;
     lastSendTs = now2;
 
     logUser(finalText);
     sendToBot(finalText);
   };
 
-  // Watchdog: every 6s
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
@@ -575,7 +623,6 @@ function ensureASR(){
   return rec;
 }
 
-/* ---------- Networking ---------- */
 async function safeJson(resp){
   const text = await resp.text();
   try { return JSON.parse(text); } catch { return { error_text: text }; }
@@ -598,7 +645,7 @@ async function sendToBot(text){
     stopBotAudio();
     startBtn.textContent = "Start Conversation";
     try {
-      const r = await fetch("/api/reply", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
+      const r = await fetch("/api/reply", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ cid: clientId, text }) });
       const d = await safeJson(r);
       if (d.dbg) logMeta("Server: " + d.dbg); if (d.tts_error) logErr("TTS: " + d.tts_error);
     } catch(e){ logErr("Stop send failed: " + e); }
@@ -610,7 +657,7 @@ async function sendToBot(text){
   try {
     const r = await fetch("/api/reply", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ cid: clientId, text })
     });
     const d = await safeJson(r);
 
@@ -628,7 +675,7 @@ async function sendToBot(text){
         setupAudioAnalyzer();
         if (audioCtx?.state === "suspended") { try { audioCtx.resume(); } catch(_){} }
         await player.play();
-        fetch("/api/ack_assistant", { method:"POST" }).catch(()=>{});
+        fetch("/api/ack_assistant", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ cid: clientId }) }).catch(()=>{});
       } catch(e){ logErr("Audio play failed: " + e); }
     }
   } catch(e){
@@ -636,7 +683,6 @@ async function sendToBot(text){
   }
 }
 
-/* ---------- UI events ---------- */
 player.onpause = () => { assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; };
 player.onended = () => { assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; };
 
@@ -649,7 +695,7 @@ if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
   });
 }
 
-startBtn.onclick = async () => {
+startBtn.addEventListener("click", async () => {
   if (!session) {
     try {
       await navigator.mediaDevices.getUserMedia({
@@ -663,7 +709,7 @@ startBtn.onclick = async () => {
 
     try {
       if (!introPlayed) {
-        const resp = await fetch("/api/intro", { method:"POST" });
+        const resp = await fetch("/api/intro", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ cid: clientId }) });
         const d = await safeJson(resp);
         introPlayed = true;
         if (d.dbg) logMeta("Server: " + d.dbg);
@@ -676,7 +722,7 @@ startBtn.onclick = async () => {
             setupAudioAnalyzer();
             if (audioCtx?.state === "suspended") { try { audioCtx.resume(); } catch(_){} }
             await player.play();
-            fetch("/api/ack_assistant", { method:"POST" }).catch(()=>{});
+            fetch("/api/ack_assistant", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ cid: clientId }) }).catch(()=>{});
           } catch(e){ logErr("Audio play failed: " + e); }
         }
       }
@@ -687,7 +733,7 @@ startBtn.onclick = async () => {
     if (asrWatchdog) { clearInterval(asrWatchdog); asrWatchdog = null; }
     try { player.pause(); } catch(_) {}
   }
-};
+});
 </script>
 </body></html>
 """
@@ -696,6 +742,5 @@ startBtn.onclick = async () => {
     return resp
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5050))  # Render requires PORT
+    port = int(os.environ.get("PORT", 5050))  # Render injects PORT
     app.run(host="0.0.0.0", port=port, debug=True)
