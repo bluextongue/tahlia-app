@@ -19,7 +19,7 @@ from urllib3.util.retry import Retry
 ELEVEN_API_KEY = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
 ELEVEN_VOICE_ID = "XeomjLZoU5rr4yNIg16w"
 
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 OPENAI_MODEL = "gpt-4o-mini"
 
 ASSISTANT_NAME = "Tahlia"
