@@ -16,7 +16,7 @@ ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a60665
 ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
 
 OPENAI_API_KEY  = "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"
-OPENAI_MODEL    = "gpt-4o-mini" 
+OPENAI_MODEL    = "gpt-4o-mini"
 ASSISTANT_NAME  = os.environ.get("ASSISTANT_NAME", "Tahlia")
 
 app = Flask(__name__)
@@ -32,19 +32,24 @@ def sget(key, default):
         fsession[key] = default
     return fsession[key]
 
-def sset(key, val): fsession[key] = val
+def sset(key, val):
+    fsession[key] = val
 
 def append_capped(key, item, cap=16):
     lst = sget(key, [])
     lst.append(item)
-    if len(lst) > cap: lst = lst[-cap:]
-    sset(key, lst); return lst
+    if len(lst) > cap:
+        lst = lst[-cap:]
+    sset(key, lst)
+    return lst
 
-def norm(s): return re.sub(r"\s+", " ", (s or "").strip()).lower()
+def norm(s):
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 def concise(text, max_chars=500, max_sents=3):
     t = (text or "").strip()
-    if not t: return t
+    if not t:
+        return t
     sents = re.split(r"(?<=[.!?])\s+", t)
     t = " ".join(sents[:max_sents]).strip()
     if len(t) > max_chars:
@@ -66,7 +71,12 @@ def openai_chat(history_msgs, temperature=0.5, max_tokens=300):
         return "I’m not configured with an OpenAI API key."
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": OPENAI_MODEL, "messages": history_msgs, "temperature": temperature, "max_tokens": max_tokens}
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": history_msgs,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
     r = http.post(url, headers=headers, json=payload, timeout=(10, 60))
     r.raise_for_status()
     data = r.json()
@@ -74,16 +84,23 @@ def openai_chat(history_msgs, temperature=0.5, max_tokens=300):
 
 def tts_b64(text: str):
     """Return data: URI base64 MP3 via ElevenLabs, or ('','') if no key or text empty."""
-    if not ELEVEN_API_KEY: return "", ""
+    if not ELEVEN_API_KEY:
+        return "", ""
     safe = (text or "").strip()
-    if not safe: return "", ""
+    if not safe:
+        return "", ""
     safe = safe[:650]
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {
         "text": safe,
         "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
+        "voice_settings": {
+            "stability": 0.45,
+            "similarity_boost": 0.85,
+            "style": 0.25,
+            "use_speaker_boost": True
+        },
         "output_format": "mp3_22050_64"
     }
     r = http.post(url, headers=headers, json=payload, timeout=(10, 60))
@@ -125,7 +142,7 @@ def api_reply():
     # Call model
     try:
         reply = openai_chat(msgs)
-    except Exception as e:
+    except Exception:
         reply = "Sorry—something hiccuped on my side. What did you want me to focus on first?"
 
     reply = concise(reply, max_chars=500, max_sents=3)
@@ -206,131 +223,148 @@ const modalClose = document.getElementById("modalClose");
 const transcriptEl = document.getElementById("transcript");
 
 /* ---------- Logs ---------- */
-function logLine(kind, text){ const d=document.createElement("div"); d.className="line "+(kind||"meta"); d.textContent=text; transcriptEl.appendChild(d); transcriptEl.scrollTop=transcriptEl.scrollHeight; }
-const logUser=(t)=>logLine("user","You: "+t);
-const logBot =(t)=>logLine("bot","{ASSISTANT_NAME}: "+t);
-const logErr =(t)=>logLine("sys","Error: "+t);
-const logMeta=(t)=>logLine("meta",t);
+function logLine(kind, text) {{
+  const d = document.createElement("div");
+  d.className = "line " + (kind || "meta");
+  d.textContent = text;
+  transcriptEl.appendChild(d);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}}
+const logUser = (t) => logLine("user", "You: " + t);
+const logBot  = (t) => logLine("bot", "{ASSISTANT_NAME}: " + t);
+const logErr  = (t) => logLine("sys", "Error: " + t);
+const logMeta = (t) => logLine("meta", t);
 
 /* ---------- Modal ---------- */
-function openModal(){ modalBackdrop.style.display="flex"; }
-function closeModal(){ modalBackdrop.style.display="none"; }
-logsBtn.onclick=openModal; modalClose.onclick=closeModal;
-modalBackdrop.addEventListener("click",(e)=>{ if(e.target===modalBackdrop) closeModal(); });
+function openModal() {{ modalBackdrop.style.display = "flex"; }}
+function closeModal() {{ modalBackdrop.style.display = "none"; }}
+logsBtn.onclick = openModal; modalClose.onclick = closeModal;
+modalBackdrop.addEventListener("click", (e) => {{ if (e.target === modalBackdrop) closeModal(); }});
 
 /* ---------- State ---------- */
-let rec=null, session=false, introDone=false, lastBotReply="";
-let assistantSpeaking=false, botSpeakingSince=0;
+let rec = null, session = false, introDone = false, lastBotReply = "";
+let assistantSpeaking = false, botSpeakingSince = 0;
 
 /* ---------- Reactive ball (assistant audio only) ---------- */
-let audioCtx=null, mediaSrc=null, analyser=null, dataArray=null, volEMA=0;
-function setupAnalyzer(){
-  if(audioCtx) return;
-  try{
-    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
-    mediaSrc=audioCtx.createMediaElementSource(player);
-    analyser=audioCtx.createAnalyser(); analyser.fftSize=2048;
-    dataArray=new Uint8Array(analyser.frequencyBinCount);
+let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null, volEMA = 0;
+function setupAnalyzer() {{
+  if (audioCtx) return;
+  try {{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    mediaSrc = audioCtx.createMediaElementSource(player);
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048;
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
     mediaSrc.connect(analyser); mediaSrc.connect(audioCtx.destination);
     animateBall();
-  }catch(e){ logErr("Audio analyzer init failed: "+e); }
-}
-function animateBall(){
-  if(!analyser||!dataArray){ requestAnimationFrame(animateBall); return; }
+  }} catch(e) {{ logErr("Audio analyzer init failed: " + e); }}
+}}
+function animateBall() {{
+  if (!analyser || !dataArray) {{ requestAnimationFrame(animateBall); return; }}
   analyser.getByteTimeDomainData(dataArray);
-  let sum=0; for(let i=0;i<dataArray.length;i++){ const v=(dataArray[i]-128)/128; sum+=v*v; }
-  const rms=Math.sqrt(sum/dataArray.length);
-  const target=assistantSpeaking?rms:0;
-  volEMA=volEMA*0.85+target*0.15;
-  const scale=1+Math.min(0.9, volEMA*2.2);
-  ball.style.transform="scale("+scale.toFixed(3)+")";
+  let sum = 0; for (let i = 0; i < dataArray.length; i++) {{ const v = (dataArray[i] - 128) / 128; sum += v*v; }}
+  const rms = Math.sqrt(sum / dataArray.length);
+  const target = assistantSpeaking ? rms : 0;
+  volEMA = volEMA * 0.85 + target * 0.15;
+  const scale = 1 + Math.min(0.9, volEMA * 2.2);
+  ball.style.transform = "scale(" + scale.toFixed(3) + ")";
   requestAnimationFrame(animateBall);
-}
+}}
 
 /* ---------- ASR (very simple) ---------- */
-function ensureASR(){
-  if(rec) return rec;
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){ alert("SpeechRecognition not supported. Use Chrome."); return null; }
-  rec=new SR(); rec.continuous=true; rec.interimResults=true; rec.lang="en-US";
+function ensureASR() {{
+  if (rec) return rec;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {{ alert("SpeechRecognition not supported. Use Chrome."); return null; }}
+  rec = new SR(); rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
 
-  rec.onresult=(evt)=>{
-    let finalText="";
-    for(let i=evt.resultIndex;i<evt.results.length;i++){
-      const res=evt.results[i], txt=(res[0]?.transcript||"").trim();
-      if(res.isFinal && txt) finalText+=txt+" ";
-    }
-    finalText=(finalText||"").trim();
-    if(!finalText) return;
-    if(lastBotReply && finalText.toLowerCase()===lastBotReply.toLowerCase()) return;
+  rec.onresult = (evt) => {{
+    let finalText = "";
+    for (let i = evt.resultIndex; i < evt.results.length; i++) {{
+      const res = evt.results[i], txt = (res[0]?.transcript || "").trim();
+      if (res.isFinal && txt) finalText += txt + " ";
+    }}
+    finalText = (finalText || "").trim();
+    if (!finalText) return;
+    if (lastBotReply && finalText.toLowerCase() === lastBotReply.toLowerCase()) return;
     logUser(finalText);
     sendToBot(finalText);
-  };
+  }};
 
-  rec.onstart = ()=>logMeta("ASR started");
-  rec.onerror = (e)=>logErr("ASR error: "+(e?.error||"unknown"));
-  rec.onend   = ()=>{ if(session){ setTimeout(()=>{ try{rec.start();}catch(_){}} ,250); logMeta("ASR restart"); } };
+  rec.onstart = () => logMeta("ASR started");
+  rec.onerror = (e) => logErr("ASR error: " + (e?.error || "unknown"));
+  rec.onend   = () => {{ if (session) {{ setTimeout(() => {{ try {{ rec.start(); }} catch(_ ) {{}} }}, 250); logMeta("ASR restart"); }} }};
   return rec;
-}
+}}
 
 /* ---------- Networking ---------- */
-async function safeJson(resp){ const t=await resp.text(); try{ return JSON.parse(t); }catch{ return {{ error_text:t }}; } }
+async function safeJson(resp) {{
+  const t = await resp.text();
+  try {{ return JSON.parse(t); }} catch {{ return {{ error_text: t }}; }}
+}}
 
-function stopBotAudio(){ try{ player.pause(); player.src=""; player.currentTime=0; }catch(_){}
-  assistantSpeaking=false; botSpeakingSince=0; }
+function stopBotAudio() {{
+  try {{ player.pause(); player.src = ""; player.currentTime = 0; }} catch(_ ) {{}}
+  assistantSpeaking = false; botSpeakingSince = 0;
+}}
 
-async function sendToBot(text){
-  try{
-    const r=await fetch("/api/reply",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ text }) });
-    const d=await safeJson(r);
-    if(d.dbg) logMeta("Server: "+d.dbg);
-    if(d.error_text) logErr("Server raw: "+d.error_text);
-    if(d.tts_error) logErr("TTS: "+d.tts_error);
-    if(d.reply){ lastBotReply=d.reply; logBot(d.reply); }
-    if(d.audio){
-      try{
-        player.pause(); player.src=d.audio; assistantSpeaking=true; botSpeakingSince=Date.now();
-        setupAnalyzer(); if(audioCtx?.state==="suspended"){ try{ audioCtx.resume(); }catch(_){} }
+async function sendToBot(text) {{
+  try {{
+    const r = await fetch("/api/reply", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ text }})
+    }});
+    const d = await safeJson(r);
+    if (d.dbg) logMeta("Server: " + d.dbg);
+    if (d.error_text) logErr("Server raw: " + d.error_text);
+    if (d.tts_error) logErr("TTS: " + d.tts_error);
+    if (d.reply) {{ lastBotReply = d.reply; logBot(d.reply); }}
+    if (d.audio) {{
+      try {{
+        player.pause(); player.src = d.audio; assistantSpeaking = true; botSpeakingSince = Date.now();
+        setupAnalyzer(); if (audioCtx?.state === "suspended") {{ try {{ audioCtx.resume(); }} catch(_ ) {{}} }}
         await player.play();
-      }catch(e){ logErr("Audio play failed: "+e); }
-    }
-  }catch(e){ logErr("Fetch /api/reply failed: "+e); }
-}
+      }} catch(e) {{ logErr("Audio play failed: " + e); }}
+    }}
+  }} catch(e) {{
+    logErr("Fetch /api/reply failed: " + e);
+  }}
+}}
 
 /* ---------- UI ---------- */
-player.onpause=()=>{ assistantSpeaking=false; botSpeakingSince=0; ball.style.transform="scale(1)"; };
-player.onended=()=>{ assistantSpeaking=false; botSpeakingSince=0; ball.style.transform="scale(1)"; };
+player.onpause = () => {{ assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; }};
+player.onended = () => {{ assistantSpeaking = false; botSpeakingSince = 0; ball.style.transform = "scale(1)"; }};
 
-startBtn.onclick = async ()=>{
-  if(!session){
-    try{
-      await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true }});
-    }catch(e){ alert("Microphone permission required"); return; }
+startBtn.onclick = async () => {{
+  if (!session) {{
+    try {{
+      await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
+    }} catch(e) {{ alert("Microphone permission required"); return; }}
 
-    const r=ensureASR(); if(!r) return;
-    session=true; startBtn.textContent="■ End Conversation";
-    try{ rec.start(); }catch(_){}
+    const r = ensureASR(); if (!r) return;
+    session = true; startBtn.textContent = "■ End Conversation";
+    try {{ rec.start(); }} catch(_ ) {{}}
     // One-time intro per page load
-    if(!introDone){
-      const resp=await fetch("/api/intro",{ method:"POST" });
-      const d=await safeJson(resp); introDone=true;
-      if(d.dbg) logMeta("Server: "+d.dbg);
-      if(d.reply){ lastBotReply=d.reply; logBot(d.reply); }
-      if(d.tts_error) logErr("TTS: "+d.tts_error);
-      if(d.audio){
-        try{
-          player.pause(); player.src=d.audio; assistantSpeaking=true; botSpeakingSince=Date.now();
-          setupAnalyzer(); if(audioCtx?.state==="suspended"){ try{ audioCtx.resume(); }catch(_){} }
+    if (!introDone) {{
+      const resp = await fetch("/api/intro", {{ method: "POST" }});
+      const d = await safeJson(resp); introDone = true;
+      if (d.dbg) logMeta("Server: " + d.dbg);
+      if (d.reply) {{ lastBotReply = d.reply; logBot(d.reply); }}
+      if (d.tts_error) logErr("TTS: " + d.tts_error);
+      if (d.audio) {{
+        try {{
+          player.pause(); player.src = d.audio; assistantSpeaking = true; botSpeakingSince = Date.now();
+          setupAnalyzer(); if (audioCtx?.state === "suspended") {{ try {{ audioCtx.resume(); }} catch(_ ) {{}} }}
           await player.play();
-        }catch(e){ logErr("Audio play failed: "+e); }
-      }
-    }
-  }else{
-    session=false; startBtn.textContent="Start Conversation";
-    try{ rec && rec.stop(); }catch(_){}
+        }} catch(e) {{ logErr("Audio play failed: " + e); }}
+      }}
+    }}
+  }} else {{
+    session = false; startBtn.textContent = "Start Conversation";
+    try {{ rec && rec.stop(); }} catch(_ ) {{}}
     stopBotAudio();
-  }
-};
+  }}
+}};
 </script>
 </body></html>
 """
