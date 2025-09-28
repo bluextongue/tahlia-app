@@ -45,7 +45,9 @@ retry = Retry(
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
-DEFAULT_TIMEOUT = (5, 55)
+
+# Slightly larger timeouts for hosted environments
+DEFAULT_TIMEOUT = (10, 120)
 
 # ========= Flask + short memory =========
 app = Flask(__name__)
@@ -139,6 +141,27 @@ def not_duplicate_bot(text: str) -> bool:
 def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
 
+def rephrase_local(text: str) -> str:
+    """
+    Lightweight local variation to avoid exact duplicates without another LLM call.
+    Keeps the original guidance but changes framing so it won't be identical.
+    """
+    if not text:
+        return text
+
+    # Trim trailing question to avoid stacking questions
+    t = re.sub(r"\?\s*$", ".", text).strip()
+
+    prefixes = [
+        "Another small angle you could try now: ",
+        "If that doesn't fit, try this tiny step: ",
+        "One more low-friction tweak to try: ",
+        "A quick variation you can test: ",
+    ]
+    idx = abs(hash(text)) % len(prefixes)
+    out = prefixes[idx] + t
+    return concise(out)
+
 # ========= OpenAI Chat =========
 def openai_chat(messages, model=OPENAI_MODEL, temperature=0.72, max_tokens=320):
     url = "https://api.openai.com/v1/chat/completions"
@@ -187,8 +210,7 @@ def llm_reply(user_text: str) -> tuple[str, str]:
 
     # Avoid duplicating exactly the last bot line
     if norm(reply) == norm(LAST_REPLY):
-        msgs.append({"role": "system", "content": "Regenerate with noticeably different wording from your previous reply. Do not repeat yourself. Offer one concrete tip first."})
-        reply = concise(sample(msgs, temp=0.7))
+        reply = concise(rephrase_local(reply))
         dbg = "regen_avoid_last"
 
     history.append(("user", user_text))
@@ -290,30 +312,14 @@ def api_reply():
     else:
         reply, dbg = llm_reply(user_text)
 
-    # If reply duplicates the last bot line, try to regenerate server-side
+    # If reply duplicates the last bot line, do a local variation (no extra LLM call)
     if norm(reply) == norm(LAST_REPLY):
-        regen_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for role, content in list(history)[-12:]:
-            regen_msgs.append({"role": role, "content": content})
-        regen_msgs.append({"role": "user", "content": user_text})
-        regen_msgs.append({"role": "system", "content": "Regenerate with different words than your last response. No repetition. Provide one concrete, practical tip first."})
-        try:
-            alt = openai_chat(regen_msgs, temperature=0.7, max_tokens=360)
-            alt = concise(alt)
-            if norm(alt) != norm(LAST_REPLY):
-                reply = alt
-                dbg = "dedup_regen_1"
-            else:
-                regen_msgs.append({"role": "system", "content": "Try again with a fresh angle. Vary verbs, sentence openings, and examples. Avoid any phrasing you previously used."})
-                alt2 = openai_chat(regen_msgs, temperature=0.8, max_tokens=360)
-                alt2 = concise(alt2)
-                if norm(alt2) != norm(LAST_REPLY):
-                    reply = alt2
-                    dbg = "dedup_regen_2"
-                else:
-                    dbg = "dedup_gave_up"
-        except Exception:
-            dbg = "dedup_regen_error"
+        varied = rephrase_local(reply)
+        if norm(varied) != norm(LAST_REPLY):
+            reply = varied
+            dbg = "dedup_local_variation"
+        else:
+            dbg = "dedup_local_passthrough"
 
     audio, tts_err = tts_b64(reply)
     LAST_REPLY = reply
@@ -542,8 +548,7 @@ function ensureASR(){
   };
   rec.onerror = (e) => {
     if (!session) return;
-    asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " -> restarting");
-    setTimeout(() => startASRSafe(200), 300);
+    asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " -> restarting"); setTimeout(() => startASRSafe(200), 300);
   };
 
   rec.onresult = (evt) => {
@@ -573,18 +578,18 @@ function ensureASR(){
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
-    if (now2 - lastSendTs < 220) return;  // faster debounce
+    if (now2 - lastSendTs < 220) return;  # faster debounce
     lastSendTs = now2;
 
     logUser(finalText);
     sendToBot(finalText);
   };
 
-  // Watchdog: every 6s, only restart (and log) if needed; larger threshold to reduce noise
+  # Watchdog: every 6s, only restart (and log) if needed; larger threshold to reduce noise
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
-    const tooLongSinceStart = Date.now() - lastASRStartTs > 30000; // was 12000
+    const tooLongSinceStart = Date.now() - lastASRStartTs > 30000; # was 12000
     const needsRestart = (asrState !== "running" && asrState !== "starting") || tooLongSinceStart;
     if (needsRestart) {
       logMeta("ASR watchdog kick");
