@@ -9,8 +9,12 @@
 # - Voice-reactive ball: scales with assistant audio volume (and stays audible)
 # - Default port 5050
 
-import base64, re, time
+import os
+import base64
+import re
+import time
 from collections import deque
+
 from flask import Flask, request, jsonify, make_response
 
 import requests
@@ -18,20 +22,29 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ========= YOUR API KEYS (LOCAL ONLY) =========
-ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
+ELEVEN_API_KEY = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
 ELEVEN_VOICE_ID = "XeomjLZoU5rr4yNIg16w"
 
-OPENAI_API_KEY  = "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"
-OPENAI_MODEL    = "gpt-4o-mini"  # try "o4-mini" or "o4" for smarter
+OPENAI_API_KEY = "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"
+OPENAI_MODEL = "gpt-4o-mini"  # try "o4-mini" or "o4" for smarter
 
-ASSISTANT_NAME  = "Tahlia"
+ASSISTANT_NAME = "Tahlia"
 
 # ========= HTTP session with retries =========
 session = requests.Session()
-retry = Retry(total=3, connect=3, read=3, status=3, backoff_factor=0.35,
-              status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"], raise_on_status=False)
+retry = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    status=3,
+    backoff_factor=0.35,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods={"GET", "POST"},
+    raise_on_status=False,
+)
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-session.mount("https://", adapter); session.mount("http://", adapter)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 DEFAULT_TIMEOUT = (5, 55)
 
 # ========= Flask + short memory =========
@@ -39,9 +52,9 @@ app = Flask(__name__)
 history = deque(maxlen=16)
 
 # ---- session state flags (server) ----
-INTRO_SENT  = False
-LAST_SPOKE  = None           # "user" | "assistant" | None
-LAST_REPLY  = ""             # last assistant text (to block dupes)
+INTRO_SENT = False
+LAST_SPOKE = None           # "user" | "assistant" | None
+LAST_REPLY = ""             # last assistant text (to block dupes)
 RECENT_ASSIST = deque(maxlen=6)
 
 # ========= Prompts and rules =========
@@ -65,8 +78,8 @@ SYSTEM_PROMPT = (
     "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately."
 )
 
-CRISIS_TRIGGERS = ("kill myself","suicide","hurt myself","harm myself","overdose","end my life","take my life","self harm","self-harm")
-STOP_WORDS = ("stop","quit","end","goodbye","end call","terminate")
+CRISIS_TRIGGERS = ("kill myself", "suicide", "hurt myself", "harm myself", "overdose", "end my life", "take my life", "self harm", "self-harm")
+STOP_WORDS = ("stop", "quit", "end", "goodbye", "end call", "terminate")
 
 # ========= Helpers =========
 def norm(s: str) -> str:
@@ -82,7 +95,8 @@ def detect_crisis(text: str) -> bool:
 
 def concise(text: str, max_chars: int = 520, max_sents: int = 5) -> str:
     t = (text or "").strip()
-    if not t: return t
+    if not t:
+        return t
     sents = re.split(r"(?<=[.!?])\s+", t)
     t = " ".join(sents[:max_sents]).strip()
     if len(t) > max_chars:
@@ -91,7 +105,8 @@ def concise(text: str, max_chars: int = 520, max_sents: int = 5) -> str:
     return t
 
 def jaccard(a: set, b: set) -> float:
-    if not a and not b: return 0.0
+    if not a and not b:
+        return 0.0
     inter = len(a & b)
     return inter / (len(a | b) or 1)
 
@@ -101,7 +116,8 @@ def tokset(s: str) -> set:
 def too_similar(new: str, refs: list[str], threshold: float = 0.90) -> bool:
     A = tokset(new)
     for r in refs:
-        if not r: continue
+        if not r:
+            continue
         if jaccard(A, tokset(r)) >= threshold:
             return True
     return False
@@ -109,7 +125,8 @@ def too_similar(new: str, refs: list[str], threshold: float = 0.90) -> bool:
 BANNED_PREFIXES = ("i’m here with you", "let’s take it one step at a time")
 
 def not_duplicate_user(text: str) -> bool:
-    if not history: return True
+    if not history:
+        return True
     last = history[-1]
     return not (last[0] == "user" and norm(last[1]) == norm(text))
 
@@ -173,9 +190,11 @@ def llm_reply(user_text: str) -> tuple[str, str]:
 
 # ========= ElevenLabs TTS =========
 def tts_b64(text: str):
-    if not ELEVEN_API_KEY: return "", "Missing ELEVENLABS_API_KEY"
+    if not ELEVEN_API_KEY:
+        return "", "Missing ELEVENLABS_API_KEY"
     safe_text = (text or "").strip()
-    if not safe_text: return "", ""
+    if not safe_text:
+        return "", ""
     safe_text = safe_text[:650]
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
@@ -191,12 +210,15 @@ def tts_b64(text: str):
         try:
             r = session.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
-                if i < 2: time.sleep(0.15 * (i + 1)); continue
+                if i < 2:
+                    time.sleep(0.15 * (i + 1))
+                    continue
                 return "", f"TTS HTTP {r.status_code}: {r.text[:200]}"
             b64 = base64.b64encode(r.content).decode("utf-8")
             return "data:audio/mpeg;base64," + b64, ""
         except Exception as e:
-            if i == 2: return "", f"TTS exception: {e}"
+            if i == 2:
+                return "", f"TTS exception: {e}"
             time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
@@ -258,8 +280,7 @@ def api_reply():
         history.append(("user", user_text)); history.append(("assistant", reply))
         dbg = "crisis"
     else:
-        if LAST_SPOKE != "user":
-            return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_speak_guard"}), 200
+        # Note: client sends /api/ack_assistant after audio; LAST_SPOKE updates to "assistant" there.
         reply, dbg = llm_reply(user_text)
 
     # Block exact duplicate bot lines
