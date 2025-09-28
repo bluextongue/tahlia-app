@@ -189,7 +189,7 @@ def llm_reply(user_text: str) -> tuple[str, str]:
             return out
         except Exception:
             return ("Here's something concrete to try right now: put a 2-minute timer and write the one problem "
-                    "in a single sentence, then underline the part you can influence today. What's the tiniest next step?")
+                    in a single sentence, then underline the part you can influence today. What's the tiniest next step?")
 
     dbg = "ok"
     reply = concise(sample(msgs))
@@ -578,18 +578,19 @@ function ensureASR(){
     const lw = finalText.toLowerCase();
     if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
     const now2 = Date.now();
-    if (now2 - lastSendTs < 220) return;  # faster debounce
+    // faster debounce
+    if (now2 - lastSendTs < 220) return;
     lastSendTs = now2;
 
     logUser(finalText);
     sendToBot(finalText);
   };
 
-  # Watchdog: every 6s, only restart (and log) if needed; larger threshold to reduce noise
+  // Watchdog: every 6s, only restart (and log) if needed; larger threshold to reduce noise
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
-    const tooLongSinceStart = Date.now() - lastASRStartTs > 30000; # was 12000
+    const tooLongSinceStart = Date.now() - lastASRStartTs > 30000; // was 12000
     const needsRestart = (asrState !== "running" && asrState !== "starting") || tooLongSinceStart;
     if (needsRestart) {
       logMeta("ASR watchdog kick");
