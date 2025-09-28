@@ -59,26 +59,29 @@ RECENT_ASSIST = deque(maxlen=6)
 
 # ========= Prompts and rules =========
 SYSTEM_PROMPT = (
-    f"You are {ASSISTANT_NAME}, a warm, natural, therapist-like conversational partner. "
+    "You are " + ASSISTANT_NAME + ", a warm, natural, therapist-like conversational partner. "
     "Respond like a thoughtful human: brief reflection first, then one specific, practical tip the user can try now. "
     "Favor concrete help over broad platitudes. Offer a targeted micro-step, example, or tiny script the user could use. "
-    "Keep 2–4 sentences by default; go up to 5 when the user shares detail or asks for depth. "
+    "Keep 2-4 sentences by default; go up to 5 when the user shares detail or asks for depth. "
     "Ask at most one short, purposeful question—and only after giving something useful. "
     "Vary your wording; avoid repeating lines or canned phrases. "
     "Steer clear of vague prompts like 'how are you coping' unless the user invites it. "
     "Useful focus areas to select from (pick just one per turn unless asked): "
-    "• emotion naming or a 60-second grounding (e.g., 5-4-3-2-1), "
-    "• a tiny behavior experiment (next 24h), "
-    "• cognitive reframe (spot one thought and try an alternative), "
-    "• sleep or body basics (one tweak, not a list), "
-    "• boundary or ask-for-help micro-script, "
-    "• urge surfing (notice–name–ride), "
-    "• planning a smallest-next-step. "
-    "Avoid the phrases “I’m here with you” and “Let’s take it one step at a time.” "
+    "- emotion naming or a 60-second grounding (e.g., 5-4-3-2-1), "
+    "- a tiny behavior experiment (next 24h), "
+    "- cognitive reframe (spot one thought and try an alternative), "
+    "- sleep or body basics (one tweak, not a list), "
+    "- boundary or ask-for-help micro-script, "
+    "- urge surfing (notice-name-ride), "
+    "- planning a smallest-next-step. "
+    "Avoid the phrases 'I'm here with you' and 'Let's take it one step at a time.' "
     "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately."
 )
 
-CRISIS_TRIGGERS = ("kill myself", "suicide", "hurt myself", "harm myself", "overdose", "end my life", "take my life", "self harm", "self-harm")
+CRISIS_TRIGGERS = (
+    "kill myself", "suicide", "hurt myself", "harm myself", "overdose",
+    "end my life", "take my life", "self harm", "self-harm"
+)
 STOP_WORDS = ("stop", "quit", "end", "goodbye", "end call", "terminate")
 
 # ========= Helpers =========
@@ -122,7 +125,7 @@ def too_similar(new: str, refs: list[str], threshold: float = 0.90) -> bool:
             return True
     return False
 
-BANNED_PREFIXES = ("i’m here with you", "let’s take it one step at a time")
+BANNED_PREFIXES = ("i'm here with you", "let's take it one step at a time")
 
 def not_duplicate_user(text: str) -> bool:
     if not history:
@@ -139,7 +142,7 @@ def ends_with_question(s: str) -> bool:
 # ========= OpenAI Chat =========
 def openai_chat(messages, model=OPENAI_MODEL, temperature=0.72, max_tokens=320):
     url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": "Bearer " + OPENAI_API_KEY, "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
     if r.status_code >= 400:
@@ -148,45 +151,50 @@ def openai_chat(messages, model=OPENAI_MODEL, temperature=0.72, max_tokens=320):
     return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
 
 def llm_reply(user_text: str) -> tuple[str, str]:
+    # Ensure reply is not a near-duplicate and not equal to LAST_REPLY
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for role, content in list(history)[-12:]:
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": user_text})
 
+    def sample(messages, temp=0.6, max_tokens=360):
+        try:
+            out = openai_chat(messages, temperature=temp, max_tokens=max_tokens)
+            if not out:
+                return ("Here's one simple thing to try: name what feels most present right now in one word, "
+                        "then take a slow 4-count inhale and 6-count exhale. What feels even 5% lighter?")
+            return out
+        except Exception:
+            return ("Here's something concrete to try right now: put a 2-minute timer and write the one problem "
+                    "in a single sentence, then underline the part you can influence today. What's the tiniest next step?")
+
     dbg = "ok"
-    try:
-        reply = openai_chat(msgs, temperature=0.6, max_tokens=360) or \
-                "Here’s one simple thing to try: name what feels most present right now in one word, then take a slow 4-count inhale and 6-count exhale. What feels even 5% lighter?"
-    except Exception:
-        reply = ("Here’s something concrete to try right now: put a 2-minute timer and write the one problem in a single sentence, "
-                 "then underline the part you can influence today. What’s the tiniest next step?")
-    final = concise(reply)
+    reply = concise(sample(msgs))
 
-    # Avoid ending with a question too often (don’t stack question endings)
+    # Avoid stacking question endings
     recent_qs = sum(1 for r in list(RECENT_ASSIST)[-2:] if ends_with_question(r))
-    if ends_with_question(final) and recent_qs >= 1:
+    if ends_with_question(reply) and recent_qs >= 1:
         msgs.append({"role": "system", "content": "Regenerate the reply without ending in a question. Provide one specific, practical tip the user can try now."})
-        try:
-            alt = openai_chat(msgs, temperature=0.6, max_tokens=360) or final
-            final = concise(alt)
-            dbg = "regen_no_question"
-        except Exception:
-            pass
+        reply = concise(sample(msgs))
+        dbg = "regen_no_question"
 
-    low = norm(final)
-    if low.startswith(BANNED_PREFIXES) or too_similar(final, list(RECENT_ASSIST)):
+    # Diversity: banned starts or too similar to recent
+    low = norm(reply)
+    if low.startswith(BANNED_PREFIXES) or too_similar(reply, list(RECENT_ASSIST), threshold=0.90):
         msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user's last message. Allow up to 5 sentences if helpful."})
-        try:
-            alt = openai_chat(msgs, temperature=0.6, max_tokens=360) or final
-            final = concise(alt)
-            dbg = "regen_diversity"
-        except Exception:
-            dbg = "ok"
+        reply = concise(sample(msgs))
+        dbg = "regen_diversity"
+
+    # Avoid duplicating exactly the last bot line
+    if norm(reply) == norm(LAST_REPLY):
+        msgs.append({"role": "system", "content": "Regenerate with noticeably different wording from your previous reply. Do not repeat yourself. Offer one concrete tip first."})
+        reply = concise(sample(msgs, temp=0.7))
+        dbg = "regen_avoid_last"
 
     history.append(("user", user_text))
-    history.append(("assistant", final))
-    RECENT_ASSIST.append(final)
-    return final, dbg
+    history.append(("assistant", reply))
+    RECENT_ASSIST.append(reply)
+    return reply, dbg
 
 # ========= ElevenLabs TTS =========
 def tts_b64(text: str):
@@ -203,7 +211,7 @@ def tts_b64(text: str):
         "text": safe_text,
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
-        "output_format": "mp3_22050_64"  # smaller & faster than 44.1k/128
+        "output_format": "mp3_22050_64"
     }
 
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
@@ -228,7 +236,7 @@ def api_intro():
     global INTRO_SENT, LAST_SPOKE, LAST_REPLY, RECENT_ASSIST
     if INTRO_SENT:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_intro_blocked"}), 200
-    intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
+    intro = "Hey, I'm " + ASSISTANT_NAME + ". Your mental health assistant."
     history.clear(); RECENT_ASSIST.clear()
     INTRO_SENT = True
     LAST_SPOKE = None
@@ -273,19 +281,39 @@ def api_reply():
     # Crisis path
     if detect_crisis(lower_text):
         reply = concise(
-            "I’m really glad you told me. If you’re in immediate danger, call 911. "
+            "I'm really glad you told me. If you're in immediate danger, call 911. "
             "In the U.S., you can call or text 988 for the Suicide & Crisis Lifeline. "
             "Would you like resources now?"
         )
         history.append(("user", user_text)); history.append(("assistant", reply))
         dbg = "crisis"
     else:
-        # Note: client sends /api/ack_assistant after audio; LAST_SPOKE updates to "assistant" there.
         reply, dbg = llm_reply(user_text)
 
-    # Block exact duplicate bot lines
-    if not not_duplicate_bot(reply):
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "dedup_bot"}), 200
+    # If reply duplicates the last bot line, try to regenerate server-side
+    if norm(reply) == norm(LAST_REPLY):
+        regen_msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for role, content in list(history)[-12:]:
+            regen_msgs.append({"role": role, "content": content})
+        regen_msgs.append({"role": "user", "content": user_text})
+        regen_msgs.append({"role": "system", "content": "Regenerate with different words than your last response. No repetition. Provide one concrete, practical tip first."})
+        try:
+            alt = openai_chat(regen_msgs, temperature=0.7, max_tokens=360)
+            alt = concise(alt)
+            if norm(alt) != norm(LAST_REPLY):
+                reply = alt
+                dbg = "dedup_regen_1"
+            else:
+                regen_msgs.append({"role": "system", "content": "Try again with a fresh angle. Vary verbs, sentence openings, and examples. Avoid any phrasing you previously used."})
+                alt2 = openai_chat(regen_msgs, temperature=0.8, max_tokens=360)
+                alt2 = concise(alt2)
+                if norm(alt2) != norm(LAST_REPLY):
+                    reply = alt2
+                    dbg = "dedup_regen_2"
+                else:
+                    dbg = "dedup_gave_up"
+        except Exception:
+            dbg = "dedup_regen_error"
 
     audio, tts_err = tts_b64(reply)
     LAST_REPLY = reply
@@ -318,7 +346,7 @@ def api_ping():
 def index():
     html = """
 <!doctype html><html><head><meta charset="utf-8"/>
-<title>Tahlia – Voice Companion</title>
+<title>Tahlia - Voice Companion</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
   :root { --bg:#0b0c10; --fg:#eaf2f8; --panel:#111417; --accent:#5b5bd6; --border:#1b1f24; }
@@ -358,7 +386,7 @@ def index():
     <div id="modal">
       <div id="modalHeader">
         <div id="modalTitle">Transcript & Logs</div>
-        <button id="modalClose" title="Close">✕</button>
+        <button id="modalClose" title="Close">X</button>
       </div>
       <div id="transcript"></div>
     </div>
@@ -429,9 +457,9 @@ function setupAudioAnalyzer(){
     const bufLen = analyser.frequencyBinCount;
     dataArray = new Uint8Array(bufLen);
 
-    // tap the signal for analysis…
+    // tap the signal for analysis...
     mediaSrc.connect(analyser);
-    // …and ALSO route the actual audio to the speakers (do NOT mute)
+    // ...and ALSO route the actual audio to the speakers (do NOT mute)
     mediaSrc.connect(audioCtx.destination);
 
     animateBall();
@@ -510,11 +538,11 @@ function ensureASR(){
   rec.onstart = () => { asrState = "running"; lastASRStartTs = Date.now(); logMeta("ASR started"); };
   rec.onend   = () => {
     if (!session) { asrState = "idle"; return; }
-    asrState = "idle"; logMeta("ASR ended → restarting"); startASRSafe(250);
+    asrState = "idle"; logMeta("ASR ended -> restarting"); startASRSafe(250);
   };
   rec.onerror = (e) => {
     if (!session) return;
-    asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " → restarting");
+    asrState = "idle"; logErr("ASR error: " + (e?.error || "unknown") + " -> restarting");
     setTimeout(() => startASRSafe(200), 300);
   };
 
@@ -552,13 +580,15 @@ function ensureASR(){
     sendToBot(finalText);
   };
 
-  // Watchdog: every 6s
+  // Watchdog: every 6s, only restart (and log) if needed; larger threshold to reduce noise
   if (asrWatchdog) clearInterval(asrWatchdog);
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
-    const tooLongSinceStart = Date.now() - lastASRStartTs > 12000;
-    if ((asrState !== "running" && asrState !== "starting") || tooLongSinceStart) {
-      logMeta("ASR watchdog kick"); startASRSafe();
+    const tooLongSinceStart = Date.now() - lastASRStartTs > 30000; // was 12000
+    const needsRestart = (asrState !== "running" && asrState !== "starting") || tooLongSinceStart;
+    if (needsRestart) {
+      logMeta("ASR watchdog kick");
+      startASRSafe();
     }
   }, 6000);
 
