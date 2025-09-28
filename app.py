@@ -5,6 +5,7 @@
 # - Faster feel: lower interrupt grace (700ms), quick send debounce (220ms)
 # - Robust LLM error logging + safe fallback that avoids duplicate blocking
 # - Modal/backdrop fix + button click fixes
+# - Minimal change: /api/intro always sends an intro (no double-intro warning)
 
 import base64, re, time, random, os, threading, json, sys
 from collections import deque, defaultdict
@@ -177,7 +178,6 @@ def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360):
     data = r.json() or {}
     cands = data.get("candidates") or []
     if not cands:
-        # log prompt feedback for debugging
         pf = data.get("promptFeedback")
         sys.stderr.write(f"\n[GEMINI EMPTY] feedback={json.dumps(pf)[:500]} raw={json.dumps(data)[:500]}\n")
         return "", "empty"
@@ -287,14 +287,11 @@ def tts_b64(text: str):
 def api_intro():
     data = request.get_json(force=True, silent=False) or {}
     cid = (data.get("cid") or "").strip()
-    st = get_state(cid)
 
-    if st.intro_sent:
-        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "double_intro_blocked"}), 200
-
-    intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
+    # Minimal change: ALWAYS reset and speak the intro. No more "double_intro_blocked".
     reset_state(cid)
     st = get_state(cid)
+    intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
     st.intro_sent = True
     st.last_spoke = None
     st.last_reply = intro
@@ -615,7 +612,7 @@ function ensureASR(){
   asrWatchdog = setInterval(() => {
     if (!session || !rec) return;
     const tooLongSinceStart = Date.now() - lastASRStartTs > 12000;
-    if ((asrState !== "running" && asrState !== "starting") || tooLongSinceStart) {
+    if ((asrState !== "running" && !recIsStarting) || tooLongSinceStart) {
       logMeta("ASR watchdog kick"); startASRSafe();
     }
   }, 6000);
