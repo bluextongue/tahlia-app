@@ -3,28 +3,30 @@
 # - Per-user session state (no global flags)
 # - One-time intro per browser session (quietly ignored if called again)
 # - Simple “warm therapist” prompt that responds to what the user just said
-# - Minimal duplicate-guard (no aggressive de-dupe that blocks legit replies)
-# - Render-friendly (uses PORT env), debug off in production
+# - Minimal duplicate-guard
+# - Render-friendly (uses PORT env), debug off
 # - Simple browser UI with Web Speech API + pink reactive ball
 
 import os, re, time, base64
 from flask import Flask, request, jsonify, make_response, session as fsession
 import requests
 
-# configuration
-ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
-ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
+# ---------- Config (env overrides are honored on Render) ----------
+ELEVEN_API_KEY  = os.environ.get("ELEVEN_API_KEY",  "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8")
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "X03mvPuTfprif8QBAVeJ")
 
-OPENAI_API_KEY  = "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"
-OPENAI_MODEL    = "gpt-4o-mini"
-ASSISTANT_NAME  = os.environ.get("ASSISTANT_NAME", "Tahlia")
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY",  "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")
+OPENAI_MODEL    = os.environ.get("OPENAI_MODEL",    "gpt-4o-mini")
+ASSISTANT_NAME  = os.environ.get("ASSISTANT_NAME",  "Tahlia")
+
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")  # allow proxy if needed
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "please-change-me")
 
 # HTTP session
 http = requests.Session()
-http.headers.update({"User-Agent": "tahlia/clean-voice-app"})
+http.headers.update({"User-Agent": "tahlia/clean-voice-app/1.0"})
 
 # ---------- Small helpers ----------
 def sget(key, default):
@@ -60,30 +62,52 @@ def concise(text, max_chars=500, max_sents=3):
 # ---------- Model ----------
 SYSTEM_PROMPT = f"""
 You are {ASSISTANT_NAME}, a warm, attentive, therapist-like conversational partner.
-Respond directly to what the user just said—reflect briefly and keep it grounded in their words.
+Respond to what the user just said—reflect briefly, stay grounded in their words.
 Be natural and conversational. Keep 1–3 short sentences (4–5 if they share details).
 Avoid canned lines and generic therapy scripts.
 If the user expresses imminent self-harm: advise calling emergency services (911 in the U.S.) or texting/calling 988 immediately.
 """.strip()
 
 def openai_chat(history_msgs, temperature=0.5, max_tokens=300):
+    """
+    Returns (reply_text, dbg_string). Never raises. Includes HTTP code/body snippet in dbg on failure.
+    """
     if not OPENAI_API_KEY:
-        return "I’m not configured with an OpenAI API key."
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        return "", "openai_missing_api_key"
+
+    url = f"{OPENAI_BASE_URL.rstrip('/')}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": OPENAI_MODEL,
         "messages": history_msgs,
         "temperature": temperature,
         "max_tokens": max_tokens
     }
-    r = http.post(url, headers=headers, json=payload, timeout=(10, 60))
-    r.raise_for_status()
-    data = r.json()
-    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip() or ""
+
+    try:
+        r = http.post(url, headers=headers, json=payload, timeout=(12, 60))
+    except Exception as e:
+        return "", f"openai_request_exc:{type(e).__name__}"
+
+    if r.status_code != 200:
+        # surface a short snippet so you see 401/429/etc. in your Live Tail “Server:” line
+        snippet = (r.text or "")[:200].replace("\n", " ")
+        return "", f"openai_http_{r.status_code}:{snippet}"
+
+    try:
+        data = r.json()
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        if not text:
+            return "", "openai_empty_choice"
+        return text, "ok"
+    except Exception as e:
+        return "", f"openai_parse_exc:{type(e).__name__}"
 
 def tts_b64(text: str):
-    """Return data: URI base64 MP3 via ElevenLabs, or ('','') if no key or text empty."""
+    """Return (data: URI base64 MP3, tts_err). Empty string pair if no key or no text."""
     if not ELEVEN_API_KEY:
         return "", ""
     safe = (text or "").strip()
@@ -103,11 +127,14 @@ def tts_b64(text: str):
         },
         "output_format": "mp3_22050_64"
     }
-    r = http.post(url, headers=headers, json=payload, timeout=(10, 60))
-    if r.status_code != 200:
-        return "", f"TTS HTTP {r.status_code}"
-    b64 = base64.b64encode(r.content).decode("utf-8")
-    return "data:audio/mpeg;base64," + b64, ""
+    try:
+        r = http.post(url, headers=headers, json=payload, timeout=(10, 60))
+        if r.status_code != 200:
+            return "", f"TTS HTTP {r.status_code}"
+        b64 = base64.b64encode(r.content).decode("utf-8")
+        return "data:audio/mpeg;base64," + b64, ""
+    except Exception as e:
+        return "", f"TTS exception: {type(e).__name__}"
 
 # ---------- API: introduction ----------
 @app.post("/api/intro")
@@ -140,21 +167,26 @@ def api_reply():
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist[-12:] + [{"role": "user", "content": user_text}]
 
     # Call model
-    try:
-        reply = openai_chat(msgs)
-    except Exception:
-        reply = "Sorry—something hiccuped on my side. What did you want me to focus on first?"
+    reply, model_dbg = openai_chat(msgs)
+    if not reply:
+        # Show *why* it failed in Live Tail; still return a polite line to the user
+        polite = "Sorry—something hiccuped on my side. What did you want me to focus on first?"
+        append_capped("history", {"role": "user", "content": user_text}, 16)
+        append_capped("history", {"role": "assistant", "content": polite}, 16)
+        sset("LAST_REPLY", polite)
+        audio, tts_err = tts_b64(polite)
+        return jsonify({"reply": polite, "audio": audio, "tts_error": tts_err, "dbg": model_dbg}), 200
 
     reply = concise(reply, max_chars=500, max_sents=3)
 
-    # Update per-user history (compact objects the OpenAI API expects)
+    # Update per-user history
     append_capped("history", {"role": "user", "content": user_text}, 16)
     append_capped("history", {"role": "assistant", "content": reply}, 16)
     sset("LAST_REPLY", reply)
 
     # TTS (optional)
     audio, tts_err = tts_b64(reply)
-    return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": "ok"}), 200
+    return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": model_dbg}), 200
 
 # ---------- API: reset ----------
 @app.post("/api/reset")
