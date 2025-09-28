@@ -1,3 +1,4 @@
-Flask>=2.0
-requests>=2.31.0
-urllib3>=2.2.0
+Flask==3.0.3
+requests==2.32.3
+urllib3==2.2.3
+gunicorn==21.2.0
