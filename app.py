@@ -3,9 +3,9 @@
 # - Per-client (cid) memory so intro/dedup/double-speak are isolated per user
 # - Always-on ASR with final-only interrupt + echo filter
 # - Faster feel: lower interrupt grace (700ms), quick send debounce (220ms)
-# - Robust LLM error logging + safe fallback that avoids duplicate blocking
-# - Modal/backdrop fix + button click fixes
-# - Minimal change: /api/intro always sends an intro (no double-intro warning)
+# - Always-intro on start (no double-intro warning)
+# - Periods-only voice style (NO COMMAS) to avoid TTS hiccups
+# - Slightly less inquisitive: fewer question endings, weighted toward statements
 
 import base64, re, time, random, os, threading, json, sys
 from collections import deque, defaultdict
@@ -23,7 +23,7 @@ ELEVEN_VOICE_ID = "q1Hhtkt94vkD6q7p50hW"
 
 # Google Gemini API (AI Studio)
 GOOGLE_API_KEY  = "AIzaSyBqKNG0-SEQapQBtZaHa_YdiabBfm_ADLY"
-GEMINI_MODEL    = "gemini-2.0-flash"   # working on v1beta generateContent
+GEMINI_MODEL    = "gemini-2.0-flash"   # v1beta generateContent
 
 ASSISTANT_NAME  = "Tahlia"
 
@@ -71,7 +71,10 @@ SYSTEM_PROMPT = (
     "• Tip (sometimes): offer a tailored, bite-sized suggestion tied to what the user said—no menus of exercises, just one concrete move. "
     "• Story (rarely): share a very short, relatable vignette ('some people find…') to normalize their experience, then invite them back. "
     "Avoid generic platitudes and the phrases “I’m here with you” and “Let’s take it one step at a time.” "
-    "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately."
+    "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately. "
+    # Voice presence + punctuation rules
+    "Write for the ear with short, concrete clauses. Use plain ASCII with short sentences. Periods only. "
+    "Do not use commas, dashes, or ellipses in your final wording so TTS reads smoothly."
 )
 
 CRISIS_TRIGGERS = ("kill myself","suicide","hurt myself","harm myself","overdose","end my life","take my life","self harm","self-harm")
@@ -128,17 +131,153 @@ def not_duplicate_bot(st: ClientState, text: str) -> bool:
 def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
 
+# ========= Style selection — slightly less inquisitive =========
 def choose_style(st: ClientState) -> str:
-    last = st.recent_style[-1] if st.recent_style else None
-    weights = {"inquire": 0.60, "tip": 0.30, "story": 0.10}
-    if last in ("tip", "story"):
-        weights = {"inquire": 0.75, "tip": 0.18, "story": 0.07}
+    last_style = st.recent_style[-1] if st.recent_style else None
+    last_msg = st.recent_assist[-1] if st.recent_assist else ""
+    last_was_question = ends_with_question(last_msg)
+
+    # Base weights: fewer questions overall
+    weights = {"inquire": 0.45, "tip": 0.40, "story": 0.15}
+
+    # If last was a question or last style was inquire, bias strongly toward non-question styles
+    if last_was_question or last_style == "inquire":
+        weights = {"inquire": 0.22, "tip": 0.58, "story": 0.20}
+
     r = random.random()
     if r < weights["inquire"]:
         return "inquire"
     elif r < weights["inquire"] + weights["tip"]:
         return "tip"
     return "story"
+
+# ========= Periods-only voice style (NO COMMAS) =========
+PUNCT_MODE = "periods_only"
+
+_CONTRACTIONS = [
+    (r"\b[Ii] am\b", "I'm"),
+    (r"\b[Yy]ou are\b", "you're"),
+    (r"\b[Tt]hey are\b", "they're"),
+    (r"\b[Ww]e are\b", "we're"),
+    (r"\b[Ii]t is\b", "it's"),
+    (r"\b[Tt]hat is\b", "that's"),
+    (r"\b[Tt]here is\b", "there's"),
+    (r"\b[Dd]o not\b", "don't"),
+    (r"\b[Cc]annot\b", "can't"),
+    (r"\b[Ii] will\b", "I'll"),
+    (r"\b[Yy]ou will\b", "you'll"),
+]
+
+def _asciify_basic(s: str) -> str:
+    # Convert smart punctuation to ASCII and remove dashes/ellipses
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("‟", '"')
+    s = s.replace("’", "'").replace("‘", "'")
+    s = s.replace("…", ".")
+    s = s.replace("—", ".").replace("–", ".")
+    # Remove zero-width characters
+    s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    return s
+
+def _split_long_sentence_into_periods(words, max_len=16):
+    # Split a long sentence (list of words) into chunks separated by periods
+    chunks, i, n = [], 0, len(words)
+    while i < n:
+        j = min(i + max_len, n)
+        chunk = " ".join(words[i:j])
+        chunks.append(chunk)
+        i = j
+    return ". ".join(chunks)
+
+def sesameify(text: str) -> str:
+    if not text:
+        return text
+    t = text.strip()
+    t = _asciify_basic(t)
+
+    # Apply ASCII contractions
+    for pat, rep in _CONTRACTIONS:
+        t = re.sub(pat, rep, t, flags=re.UNICODE)
+
+    # Remove commas entirely in periods-only mode (convert to periods)
+    if PUNCT_MODE == "periods_only":
+        t = re.sub(r",\s*", ". ", t)
+
+    # Split into sentences on ., ?, !
+    raw_sents = re.split(r"(?<=[.!?])\s+", t) if re.search(r"[.!?]", t) else [t]
+
+    # Process each sentence: ensure no commas remain, split overly long sentences with periods
+    out_sents = []
+    for s in raw_sents:
+        s = s.strip()
+        if not s:
+            continue
+        if PUNCT_MODE == "periods_only":
+            s = s.replace(",", " ")  # safety
+            s = s.replace(" - ", " ").replace("-", " ")
+            s = s.replace("..", ".")
+            # If very long and not a question, split by word count
+            words = s.replace("?", "").replace("!", "").replace(".", "").split()
+            if len(words) > 18 and not s.endswith("?"):
+                s = _split_long_sentence_into_periods(words, max_len=12)
+        out_sents.append(s)
+
+    t = " ".join(out_sents)
+
+    # Cleanup: collapse punctuation, enforce periods-only (except ? and ! when present)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    if PUNCT_MODE == "periods_only":
+        # Remove any lingering commas (just in case)
+        t = t.replace(",", " ")
+        # Remove decorative sequences
+        t = re.sub(r"\.{3,}", ".", t)
+        t = re.sub(r"\s*\.\s*\.\s*", ". ", t)
+
+    # Ensure ASCII
+    t = t.encode("ascii", "ignore").decode("ascii")
+
+    # Normalize spacing around periods
+    t = re.sub(r"\s*\.\s*", ". ", t).strip()
+
+    # Avoid trailing comma/space; if no terminal punctuation, end with period
+    if not re.search(r"[.!?]$", t):
+        t += "."
+    return t
+
+def tts_sanitize(text: str) -> str:
+    """
+    Periods-only TTS sanitization:
+    - Convert smart punctuation to ASCII
+    - No commas: turn commas into periods or spaces
+    - Collapse stacked punctuation and spaces
+    """
+    if not text:
+        return text
+    t = _asciify_basic(text)
+
+    # No commas
+    t = re.sub(r",\s*", ". ", t)
+
+    # Remove decorative stacks
+    t = re.sub(r"\.{3,}", ".", t)
+    t = re.sub(r"\s*\.\s*\.\s*", ". ", t)
+
+    # Avoid '?.' or '!.'
+    t = re.sub(r"\?\.", "?", t)
+    t = re.sub(r"!\.", "!", t)
+
+    # Normalize spaces
+    t = re.sub(r"\s{2,}", " ", t).strip()
+
+    # ASCII only
+    t = t.encode("ascii", "ignore").decode("ascii")
+
+    # Guard very long clauses: insert a period after ~140 chars without terminal punctuation
+    t = re.sub(r"([^.!?]{140,})(\s+)", r"\1. ", t)
+
+    # Ensure final punctuation
+    if not re.search(r"[.!?]$", t):
+        t += "."
+    return t
 
 # ========= Google Gemini Chat =========
 def _to_gemini_contents(messages):
@@ -166,7 +305,7 @@ def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360):
             "topP": 0.9,
             "topK": 40
         }
-        # safetySettings intentionally omitted (defaults apply)
+        # safetySettings: defaults
     }
     headers = {"Content-Type": "application/json"}
     r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
@@ -198,21 +337,24 @@ def llm_reply(st: ClientState, user_text: str) -> tuple[str, str]:
     msgs.append({"role": "user", "content": user_text})
 
     style = choose_style(st)
+
     if style == "inquire":
         msgs.append({"role": "system", "content": (
             "For THIS reply: Use the Inquire style. Give a short reflection tied to their words, "
-            "then ask ONE precise, non-generic question that helps pinpoint the root cause or a specific blocker. "
-            "No exercise suggestions in this turn."
+            "then ask ONE precise question that narrows the real issue. Keep sentences short. "
+            "Use periods only. No commas, no dashes, no ellipses."
         )})
     elif style == "tip":
         msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Tip style. Offer ONE tailored, concrete suggestion tightly linked to what they said. "
-            "Keep it tiny and situational. Optionally end with a short follow-up question."
+            "For THIS reply: Use the Tip style. Offer ONE tailored, concrete suggestion tied to what they said. "
+            "Make it a statement and do NOT end with a question. Keep sentences short. "
+            "Use periods only. No commas, no dashes, no ellipses."
         )})
     else:  # story
         msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Story style. Share a very brief, relatable vignette ('some people find…') "
-            "that normalizes their experience, then invite them back. Keep it 2–3 sentences."
+            "For THIS reply: Use the Story style. Share a very brief, relatable vignette that normalizes their experience, "
+            "then invite them back with a gentle statement. Do NOT end with a question. "
+            "Keep sentences short. Use periods only. No commas, no dashes, no ellipses."
         )})
 
     dbg = "ok"
@@ -220,30 +362,39 @@ def llm_reply(st: ClientState, user_text: str) -> tuple[str, str]:
         text, status = gemini_chat(msgs)
         if not text:
             dbg = f"llm_empty_{status}"
-            text = ("Got it—when does school feel toughest: during classes, homework load, or dealing with people there?")
+            text = ("I hear that. Tell me the moment it felt heaviest today.")
     except Exception as e:
         dbg = "llm_error"
         sys.stderr.write(f"\n[LLM ERROR] {e}\n")
-        text = ("Quick check-in: what part of school is spiking the stress most today—time pressure, a specific class, or something social?")
+        text = ("Quick check in. Which part feels hardest right now.")
 
+    # Trim and then periods-only polish
     final = concise(text)
+    final = sesameify(final)
 
-    # Avoid 3 questions in a row
-    recent_qs = sum(1 for r in list(st.recent_assist)[-3:] if ends_with_question(r))
-    if ends_with_question(final) and recent_qs >= 2:
-        msgs.append({"role": "system", "content": "Regenerate without ending in a question. Keep it specific and user-focused."})
+    # Avoid 2 questions in a row
+    recent_qs = sum(1 for r in list(st.recent_assist)[-2:] if ends_with_question(r))
+    if ends_with_question(final) and recent_qs >= 1:
+        # Ask model to regenerate without a question
+        msgs.append({"role": "system", "content": "Regenerate as a statement. Do not end with a question. Periods only. No commas."})
         try:
             alt, _ = gemini_chat(msgs)
-            if alt: final = concise(alt); dbg = "regen_no_question"
+            if alt:
+                final = sesameify(concise(alt))
+                dbg = "regen_no_question"
         except Exception:
-            pass
+            # As a fallback, convert trailing ? to .
+            final = re.sub(r"\?\s*$", ".", final).strip()
+            dbg = "forced_period"
 
     low = norm(final)
     if low.startswith(BANNED_PREFIXES) or too_similar(final, list(st.recent_assist)):
-        msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user's last message. Allow up to 5 sentences if helpful."})
+        msgs.append({"role": "system", "content": "Regenerate with different wording. Up to 5 short sentences. Periods only. No question at the end."})
         try:
             alt, _ = gemini_chat(msgs)
-            if alt: final = concise(alt); dbg = "regen_diversity"
+            if alt:
+                final = sesameify(concise(alt))
+                dbg = "regen_diversity"
         except Exception:
             pass
 
@@ -260,12 +411,16 @@ def tts_b64(text: str):
     if not safe_text: return "", ""
     safe_text = safe_text[:650]
 
+    # Sanitize for smooth periods-only TTS
+    safe_text = tts_sanitize(safe_text)
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {
         "text": safe_text,
         "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
+        # Slightly steadier settings
+        "voice_settings": {"stability": 0.50, "similarity_boost": 0.92, "style": 0.35, "use_speaker_boost": True},
         "output_format": "mp3_22050_64"
     }
 
@@ -282,16 +437,15 @@ def tts_b64(text: str):
             time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
-# ========= API: introduction =========
+# ========= API: introduction (always reset + speak) =========
 @app.post("/api/intro")
 def api_intro():
     data = request.get_json(force=True, silent=False) or {}
     cid = (data.get("cid") or "").strip()
 
-    # Minimal change: ALWAYS reset and speak the intro. No more "double_intro_blocked".
     reset_state(cid)
     st = get_state(cid)
-    intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
+    intro = sesameify(f"Hey. I'm {ASSISTANT_NAME}. Your mental health assistant.")
     st.intro_sent = True
     st.last_spoke = None
     st.last_reply = intro
@@ -329,10 +483,10 @@ def api_reply():
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "duplicate_user"}), 200
 
     if detect_crisis(lower_text):
-        reply = concise(
-            "I’m really glad you told me. If you’re in immediate danger, call 911. "
-            "In the U.S., you can call or text 988 for the Suicide & Crisis Lifeline. "
-            "Would you like resources now?"
+        reply = sesameify(
+            "I'm really glad you told me. If you're in immediate danger call 911. "
+            "In the U.S. you can call or text 988 for the Suicide and Crisis Lifeline. "
+            "I can share resources if you want."
         )
         st.history.append(("user", user_text)); st.history.append(("assistant", reply))
         dbg = "crisis"
@@ -340,7 +494,7 @@ def api_reply():
         reply, dbg = llm_reply(st, user_text)
 
     if not not_duplicate_bot(st, reply):
-        reply = reply.rstrip(".") + " — when did that start showing up for you?"
+        reply = sesameify(reply.rstrip(".!? ") + ". Tell me when that started showing up for you.")
         dbg = "dedup_softened"
 
     audio, tts_err = tts_b64(reply)
