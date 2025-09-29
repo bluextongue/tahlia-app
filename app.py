@@ -19,7 +19,7 @@ from urllib3.util.retry import Retry
 
 # ========= YOUR API KEYS (LOCAL ONLY) =========
 ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
-ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
+ELEVEN_VOICE_ID = "q1Hhtkt94vkD6q7p50hW"
 
 # Google Gemini API (AI Studio)
 GOOGLE_API_KEY  = "AIzaSyBqKNG0-SEQapQBtZaHa_YdiabBfm_ADLY"
