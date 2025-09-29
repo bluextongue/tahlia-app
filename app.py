@@ -1,11 +1,11 @@
 # app.py
 # Tahlia: Flask + Google Gemini (2.0 Flash) + ElevenLabs (per-user session state)
 # - Per-client (cid) memory so intro/dedup/double-speak are isolated per user
-# - Always-on ASR with interim endpointing + echo filter
-# - Faster feel: lower interrupt grace (400ms), quick send debounce (120ms)
-# - Always-intro on start (no double-intro warning)
-# - Periods-only voice style (NO COMMAS) to avoid TTS hiccups
-# - Slightly less inquisitive: fewer question endings, weighted toward statements
+# - Always-on ASR with final-only interrupt + echo filter
+# - Faster feel: lower interrupt grace (700ms), quick send debounce (220ms)
+# - Robust LLM error logging + safe fallback that avoids duplicate blocking
+# - Modal/backdrop fix + button click fixes
+# - Minimal change: /api/intro always sends an intro (no double-intro warning)
 
 import base64, re, time, random, os, threading, json, sys
 from collections import deque, defaultdict
@@ -23,17 +23,17 @@ ELEVEN_VOICE_ID = "zmcVlqmyk3Jpn5AVYcAL"
 
 # Google Gemini API (AI Studio)
 GOOGLE_API_KEY  = "AIzaSyBqKNG0-SEQapQBtZaHa_YdiabBfm_ADLY"
-GEMINI_MODEL    = "gemini-2.0-flash"   # v1beta generateContent
+GEMINI_MODEL    = "gemini-2.0-flash"   # working on v1beta generateContent
 
 ASSISTANT_NAME  = "Tahlia"
 
 # ========= HTTP session with retries =========
 session = requests.Session()
-retry = Retry(total=3, connect=3, read=3, status=3, backoff_factor=0.25,
+retry = Retry(total=3, connect=3, read=3, status=3, backoff_factor=0.35,
               status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"], raise_on_status=False)
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
-DEFAULT_TIMEOUT = (5, 40)
+DEFAULT_TIMEOUT = (5, 55)
 
 # ========= Flask =========
 app = Flask(__name__)
@@ -67,11 +67,11 @@ SYSTEM_PROMPT = (
     "Default stance: be genuinely curious and specific to the user's situation—ask focused, non-generic questions that help get to the root of what’s going on. "
     "Keep 2–3 sentences by default (up to 5 if the user shares details). "
     "Use one of these styles per turn (don’t stack them back-to-back): "
-    "• Inquire: reflect briefly, then ask 1 precise question that narrows the real issue. "
-    "• Tip (sometimes): offer 1 tailored, bite-sized suggestion tied to what the user said. "
-    "• Story (rarely): very short vignette to normalize the experience, then invite them back. "
+    "• Inquire: reflect briefly, then ask 1 precise question that narrows the real issue (e.g., where/when/who/what made it harder). "
+    "• Tip (sometimes): offer a tailored, bite-sized suggestion tied to what the user said—no menus of exercises, just one concrete move. "
+    "• Story (rarely): share a very short, relatable vignette ('some people find…') to normalize their experience, then invite them back. "
     "Avoid generic platitudes and the phrases “I’m here with you” and “Let’s take it one step at a time.” "
-    "Write for the ear with short, concrete clauses. Use plain ASCII with short sentences. Periods only. No commas/dashes/ellipses."
+    "Crisis: if the user indicates imminent self-harm, advise calling 911 or contacting/texting 988 (U.S. crisis line) immediately."
 )
 
 CRISIS_TRIGGERS = ("kill myself","suicide","hurt myself","harm myself","overdose","end my life","take my life","self harm","self-harm")
@@ -89,7 +89,7 @@ def detect_crisis(text: str) -> bool:
     t = norm(text)
     return any(k in t for k in CRISIS_TRIGGERS)
 
-def concise(text: str, max_chars: int = 480, max_sents: int = 5) -> str:
+def concise(text: str, max_chars: int = 520, max_sents: int = 5) -> str:
     t = (text or "").strip()
     if not t: return t
     sents = re.split(r"(?<=[.!?])\s+", t)
@@ -128,92 +128,17 @@ def not_duplicate_bot(st: ClientState, text: str) -> bool:
 def ends_with_question(s: str) -> bool:
     return bool(re.search(r"\?\s*$", (s or "")))
 
-# ========= Style selection — slightly less inquisitive =========
 def choose_style(st: ClientState) -> str:
-    last_style = st.recent_style[-1] if st.recent_style else None
-    last_msg = st.recent_assist[-1] if st.recent_assist else ""
-    last_was_question = ends_with_question(last_msg)
-    weights = {"inquire": 0.45, "tip": 0.40, "story": 0.15}
-    if last_was_question or last_style == "inquire":
-        weights = {"inquire": 0.22, "tip": 0.58, "story": 0.20}
+    last = st.recent_style[-1] if st.recent_style else None
+    weights = {"inquire": 0.60, "tip": 0.30, "story": 0.10}
+    if last in ("tip", "story"):
+        weights = {"inquire": 0.75, "tip": 0.18, "story": 0.07}
     r = random.random()
-    if r < weights["inquire"]: return "inquire"
-    elif r < weights["inquire"] + weights["tip"]: return "tip"
+    if r < weights["inquire"]:
+        return "inquire"
+    elif r < weights["inquire"] + weights["tip"]:
+        return "tip"
     return "story"
-
-# ========= Periods-only voice style (NO COMMAS) =========
-PUNCT_MODE = "periods_only"
-
-_CONTRACTIONS = [
-    (r"\b[Ii] am\b", "I'm"), (r"\b[Yy]ou are\b", "you're"), (r"\b[Tt]hey are\b", "they're"),
-    (r"\b[Ww]e are\b", "we're"), (r"\b[Ii]t is\b", "it's"), (r"\b[Tt]hat is\b", "that's"),
-    (r"\b[Tt]here is\b", "there's"), (r"\b[Dd]o not\b", "don't"), (r"\b[Cc]annot\b", "can't"),
-    (r"\b[Ii] will\b", "I'll"), (r"\b[Yy]ou will\b", "you'll"),
-]
-
-def _asciify_basic(s: str) -> str:
-    s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("‟", '"')
-    s = s.replace("’", "'").replace("‘", "'")
-    s = s.replace("…", ".")
-    s = s.replace("—", ".").replace("–", ".")
-    s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
-    return s
-
-def _split_long_sentence_into_periods(words, max_len=16):
-    chunks, i, n = [], 0, len(words)
-    while i < n:
-        j = min(i + max_len, n)
-        chunk = " ".join(words[i:j])
-        chunks.append(chunk)
-        i = j
-    return ". ".join(chunks)
-
-def sesameify(text: str) -> str:
-    if not text: return text
-    t = _asciify_basic(text.strip())
-    for pat, rep in _CONTRACTIONS:
-        t = re.sub(pat, rep, t, flags=re.UNICODE)
-    if PUNCT_MODE == "periods_only":
-        t = re.sub(r",\s*", ". ", t)
-    raw_sents = re.split(r"(?<=[.!?])\s+", t) if re.search(r"[.!?]", t) else [t]
-    out_sents = []
-    for s in raw_sents:
-        s = s.strip()
-        if not s: continue
-        if PUNCT_MODE == "periods_only":
-            s = s.replace(",", " ")
-            s = s.replace(" - ", " ").replace("-", " ")
-            s = s.replace("..", ".")
-            words = s.replace("?", "").replace("!", "").replace(".", "").split()
-            if len(words) > 18 and not s.endswith("?"):
-                s = _split_long_sentence_into_periods(words, max_len=12)
-        out_sents.append(s)
-    t = " ".join(out_sents)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    if PUNCT_MODE == "periods_only":
-        t = t.replace(",", " ")
-        t = re.sub(r"\.{3,}", ".", t)
-        t = re.sub(r"\s*\.\s*\.\s*", ". ", t)
-    t = t.encode("ascii", "ignore").decode("ascii")
-    t = re.sub(r"\s*\.\s*", ". ", t).strip()
-    if not re.search(r"[.!?]$", t):
-        t += "."
-    return t
-
-def tts_sanitize(text: str) -> str:
-    if not text: return text
-    t = _asciify_basic(text)
-    t = re.sub(r",\s*", ". ", t)
-    t = re.sub(r"\.{3,}", ".", t)
-    t = re.sub(r"\s*\.\s*\.\s*", ". ", t)
-    t = re.sub(r"\?\.", "?", t)
-    t = re.sub(r"!\.", "!", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    t = t.encode("ascii", "ignore").decode("ascii")
-    t = re.sub(r"([^.!?]{140,})(\s+)", r"\1. ", t)
-    if not re.search(r"[.!?]$", t):
-        t += "."
-    return t
 
 # ========= Google Gemini Chat =========
 def _to_gemini_contents(messages):
@@ -222,7 +147,8 @@ def _to_gemini_contents(messages):
         role = m.get("role", "user")
         text = m.get("content", "") or ""
         if role == "system":
-            role = "user"; text = f"[SYSTEM INSTRUCTIONS]\n{text}"
+            role = "user"
+            text = f"[SYSTEM INSTRUCTIONS]\n{text}"
         elif role == "assistant":
             role = "model"
         else:
@@ -230,7 +156,7 @@ def _to_gemini_contents(messages):
         contents.append({"role": role, "parts": [{"text": text}]})
     return contents
 
-def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=220):
+def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GOOGLE_API_KEY}"
     payload = {
         "contents": _to_gemini_contents(messages),
@@ -238,20 +164,24 @@ def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=220):
             "temperature": float(temperature),
             "maxOutputTokens": int(max_tokens),
             "topP": 0.9,
-            "topK": 20
+            "topK": 40
         }
+        # safetySettings intentionally omitted (defaults apply)
     }
     headers = {"Content-Type": "application/json"}
     r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
     if r.status_code >= 400:
         sys.stderr.write(f"\n[GEMINI HTTP {r.status_code}] {r.text[:500]}\n")
         raise RuntimeError(f"Gemini HTTP {r.status_code}")
+
     data = r.json() or {}
     cands = data.get("candidates") or []
     if not cands:
         pf = data.get("promptFeedback")
         sys.stderr.write(f"\n[GEMINI EMPTY] feedback={json.dumps(pf)[:500]} raw={json.dumps(data)[:500]}\n")
         return "", "empty"
+
     first = cands[0]
     parts = ((first.get("content") or {}).get("parts") or [])
     text = (parts[0].get("text") if parts else "") or ""
@@ -266,56 +196,57 @@ def llm_reply(st: ClientState, user_text: str) -> tuple[str, str]:
     for role, content in list(st.history)[-12:]:
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": user_text})
+
     style = choose_style(st)
     if style == "inquire":
         msgs.append({"role": "system", "content": (
             "For THIS reply: Use the Inquire style. Give a short reflection tied to their words, "
-            "then ask ONE precise question that narrows the real issue. Keep sentences short. "
-            "Use periods only. No commas, no dashes, no ellipses."
+            "then ask ONE precise, non-generic question that helps pinpoint the root cause or a specific blocker. "
+            "No exercise suggestions in this turn."
         )})
     elif style == "tip":
         msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Tip style. Offer ONE tailored, concrete suggestion tied to what they said. "
-            "Do not end with a question. Short sentences. Periods only. No commas."
+            "For THIS reply: Use the Tip style. Offer ONE tailored, concrete suggestion tightly linked to what they said. "
+            "Keep it tiny and situational. Optionally end with a short follow-up question."
         )})
-    else:
+    else:  # story
         msgs.append({"role": "system", "content": (
-            "For THIS reply: Use the Story style. Very brief vignette to normalize the experience, "
-            "then invite them back with a gentle statement. Do not end with a question. "
-            "Short sentences. Periods only. No commas."
+            "For THIS reply: Use the Story style. Share a very brief, relatable vignette ('some people find…') "
+            "that normalizes their experience, then invite them back. Keep it 2–3 sentences."
         )})
+
     dbg = "ok"
     try:
         text, status = gemini_chat(msgs)
         if not text:
             dbg = f"llm_empty_{status}"
-            text = ("I hear that. Tell me the moment it felt heaviest today.")
+            text = ("Got it—when does school feel toughest: during classes, homework load, or dealing with people there?")
     except Exception as e:
         dbg = "llm_error"
         sys.stderr.write(f"\n[LLM ERROR] {e}\n")
-        text = ("Quick check in. Which part feels hardest right now.")
-    final = sesameify(concise(text))
-    recent_qs = sum(1 for r in list(st.recent_assist)[-2:] if ends_with_question(r))
-    if ends_with_question(final) and recent_qs >= 1:
-        msgs.append({"role": "system", "content": "Regenerate as a statement. Do not end with a question. Periods only. No commas."})
+        text = ("Quick check-in: what part of school is spiking the stress most today—time pressure, a specific class, or something social?")
+
+    final = concise(text)
+
+    # Avoid 3 questions in a row
+    recent_qs = sum(1 for r in list(st.recent_assist)[-3:] if ends_with_question(r))
+    if ends_with_question(final) and recent_qs >= 2:
+        msgs.append({"role": "system", "content": "Regenerate without ending in a question. Keep it specific and user-focused."})
         try:
             alt, _ = gemini_chat(msgs)
-            if alt:
-                final = sesameify(concise(alt))
-                dbg = "regen_no_question"
-        except Exception:
-            final = re.sub(r"\?\s*$", ".", final).strip()
-            dbg = "forced_period"
-    low = norm(final)
-    if low.startswith(BANNED_PREFIXES) or too_similar(final, list(st.recent_assist)):
-        msgs.append({"role": "system", "content": "Regenerate with different wording. Up to 5 short sentences. Periods only. No question at the end."})
-        try:
-            alt, _ = gemini_chat(msgs)
-            if alt:
-                final = sesameify(concise(alt))
-                dbg = "regen_diversity"
+            if alt: final = concise(alt); dbg = "regen_no_question"
         except Exception:
             pass
+
+    low = norm(final)
+    if low.startswith(BANNED_PREFIXES) or too_similar(final, list(st.recent_assist)):
+        msgs.append({"role": "system", "content": "Regenerate with different wording; be specific to the user's last message. Allow up to 5 sentences if helpful."})
+        try:
+            alt, _ = gemini_chat(msgs)
+            if alt: final = concise(alt); dbg = "regen_diversity"
+        except Exception:
+            pass
+
     st.recent_style.append(style)
     st.history.append(("user", user_text))
     st.history.append(("assistant", final))
@@ -328,41 +259,44 @@ def tts_b64(text: str):
     safe_text = (text or "").strip()
     if not safe_text: return "", ""
     safe_text = safe_text[:650]
-    safe_text = tts_sanitize(safe_text)
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {
         "text": safe_text,
         "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.50, "similarity_boost": 0.92, "style": 0.35, "use_speaker_boost": True},
-        # Smaller file → starts playing sooner
-        "output_format": "mp3_16000_32"
+        "voice_settings": {"stability": 0.45, "similarity_boost": 0.85, "style": 0.25, "use_speaker_boost": True},
+        "output_format": "mp3_22050_64"
     }
+
     for i, timeout in enumerate([(5, 20), (5, 25), (6, 35)]):
         try:
             r = session.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
-                if i < 2: time.sleep(0.12 * (i + 1)); continue
+                if i < 2: time.sleep(0.15 * (i + 1)); continue
                 return "", f"TTS HTTP {r.status_code}: {r.text[:200]}"
             b64 = base64.b64encode(r.content).decode("utf-8")
             return "data:audio/mpeg;base64," + b64, ""
         except Exception as e:
             if i == 2: return "", f"TTS exception: {e}"
-            time.sleep(0.18 * (i + 1))
+            time.sleep(0.2 * (i + 1))
     return "", "TTS unknown error"
 
-# ========= API: introduction (always reset + speak) =========
+# ========= API: introduction =========
 @app.post("/api/intro")
 def api_intro():
     data = request.get_json(force=True, silent=False) or {}
     cid = (data.get("cid") or "").strip()
+
+    # Minimal change: ALWAYS reset and speak the intro. No more "double_intro_blocked".
     reset_state(cid)
     st = get_state(cid)
-    intro = sesameify(f"Hey. I'm {ASSISTANT_NAME}. Your mental health assistant.")
+    intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
     st.intro_sent = True
     st.last_spoke = None
     st.last_reply = intro
     st.recent_assist.append(intro)
+
     audio, tts_err = tts_b64(intro)
     return jsonify({"reply": intro, "audio": audio, "tts_error": tts_err, "dbg": "intro"}), 200
 
@@ -372,33 +306,43 @@ def api_reply():
     data = request.get_json(force=True, silent=False) or {}
     cid = (data.get("cid") or "").strip()
     st = get_state(cid)
+
     user_text = (data.get("text") or "").strip()
     if not user_text:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "empty_text"}), 400
+
     lower_text = norm(user_text)
+
     if contains_stop_command(lower_text):
         reset_state(cid)
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "stop_word"}), 200
+
     if lower_text == norm(st.last_reply):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "echo_bot_line"}), 200
+
     if len(lower_text) < 1:
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "too_short"}), 200
+
     st.last_spoke = "user"
+
     if not not_duplicate_user(st, lower_text):
         return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "duplicate_user"}), 200
+
     if detect_crisis(lower_text):
-        reply = sesameify(
-            "I'm really glad you told me. If you're in immediate danger call 911. "
-            "In the U.S. you can call or text 988 for the Suicide and Crisis Lifeline. "
-            "I can share resources if you want."
+        reply = concise(
+            "I’m really glad you told me. If you’re in immediate danger, call 911. "
+            "In the U.S., you can call or text 988 for the Suicide & Crisis Lifeline. "
+            "Would you like resources now?"
         )
         st.history.append(("user", user_text)); st.history.append(("assistant", reply))
         dbg = "crisis"
     else:
         reply, dbg = llm_reply(st, user_text)
+
     if not not_duplicate_bot(st, reply):
-        reply = sesameify(reply.rstrip(".!? ") + ". Tell me when that started showing up for you.")
+        reply = reply.rstrip(".") + " — when did that start showing up for you?"
         dbg = "dedup_softened"
+
     audio, tts_err = tts_b64(reply)
     st.last_reply = reply
     return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
@@ -445,12 +389,14 @@ def index():
   * { box-sizing:border-box; }
   html, body { height:100%; }
   body { background:var(--bg); color:var(--fg); margin:0; font-family:system-ui, sans-serif; display:flex; min-height:100vh; width:100vw; overflow:hidden; position:relative; }
+
   #left { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:24px; min-width:0; position:relative; z-index:1; }
   #ball { width:120px; height:120px; border-radius:50%; background:var(--accent); transition:transform 0.08s ease; box-shadow:0 10px 30px rgba(0,0,0,.3); }
   button { cursor:pointer; }
   #startBtn, #logsBtn { position:relative; z-index:2; }
   #startBtn { padding:14px 20px; border:none; border-radius:12px; background:#161a1f; color:#fff; font-weight:600; font-size:16px; box-shadow:0 2px 10px rgba(0,0,0,.25); }
   #logsBtn { padding:10px 14px; border:1px solid var(--border); border-radius:10px; background:#0e1116; color:#cfd8e3; font-weight:600; font-size:13px; }
+
   #modalBackdrop { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; pointer-events:none; align-items:center; justify-content:center; z-index:10; }
   #modalBackdrop.show { display:flex; pointer-events:auto; }
   #modal { width:min(720px, 92vw); height:min(70vh, 86vh); background:var(--panel); border:1px solid var(--border); border-radius:12px; display:flex; flex-direction:column; overflow:hidden; }
@@ -460,6 +406,7 @@ def index():
   #transcript { flex:1; overflow:auto; padding:10px; font-size:14px; line-height:1.35; }
   .line { padding:6px 8px; border-bottom:1px dashed #20242a; white-space:pre-wrap; word-break:break-word; }
   .user { color:#c9f0ff; } .bot{ color:#d7ffe0; } .sys{ color:#ffd7d7; } .meta{ font-size:12px; color:#9aa4af; }
+
   #player { position:absolute; width:0; height:0; opacity:0; pointer-events:none; }
 </style>
 </head>
@@ -529,18 +476,10 @@ let asrWatchdog = null;
 let assistantSpeaking = false;
 let wantsInterrupt = false;
 let botSpeakingSince = 0;
-const INTERRUPT_GRACE_MS = 400;      // was 700 → interrupt sooner
+const INTERRUPT_GRACE_MS = 700;
 const MIN_FINAL_LEN = 1;
 let lastSendTs = 0;
-const SEND_DEBOUNCE_MS = 120;        // was 220
-const ECHO_WINDOW_MS = 1500;         // was 1800
-
-// Endpointing parameters
-let interimBuffer = "";
-let lastInterimTs = 0;
-let endpointTimer = null;
-const SILENCE_ENDPOINT_MS = 280;     // ~240–320ms feels natural
-const MIN_ENDPOINT_CHARS = 4;        // avoid single “uh” etc.
+const ECHO_WINDOW_MS = 1800;
 
 let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null;
 let volEMA = 0;
@@ -636,58 +575,37 @@ function ensureASR(){
   };
 
   rec.onresult = (evt) => {
-    const now = Date.now();
     let finalText = "";
-    let anyInterim = false;
-    let latestInterim = "";
+    const now = Date.now();
 
     for (let i = evt.resultIndex; i < evt.results.length; i++) {
       const res = evt.results[i];
       const txt = (res[0]?.transcript || "").trim();
 
-      // If user speaks while bot is speaking, request interrupt quickly
       if (!res.isFinal && txt) {
         const elapsed = now - botSpeakingSince;
-        if (assistantSpeaking && botSpeakingSince && elapsed > INTERRUPT_GRACE_MS) wantsInterrupt = true;
-        anyInterim = true;
-        latestInterim = txt;
+        if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
       }
 
       if (res.isFinal) finalText += txt + " ";
     }
 
-    // Hard interrupt if requested
+    finalText = (finalText || "").trim();
+    if (!finalText) return;
+
+    if (likelyEcho(finalText, lastBotReply)) { logMeta("Echo filtered"); return; }
+    if (assistantSpeaking && !wantsInterrupt) return;
     if (assistantSpeaking && wantsInterrupt) { stopBotAudio(); wantsInterrupt = false; }
 
-    // True finals: send immediately
-    finalText = (finalText || "").trim();
-    if (finalText) {
-      if (!likelyEcho(finalText, lastBotReply)) {
-        pushToBot(finalText);
-      } else {
-        logMeta("Echo filtered");
-      }
-      // clear endpointing buffer
-      interimBuffer = ""; lastInterimTs = 0; if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
-      return;
-    }
+    if (finalText.length < 1) return;
+    const lw = finalText.toLowerCase();
+    if (lastBotReply && lw === lastBotReply.toLowerCase()) return;
+    const now2 = Date.now();
+    if (now2 - lastSendTs < 220) return;
+    lastSendTs = now2;
 
-    // Interim endpointing: if no new interim for ~280ms, treat interim as final
-    if (anyInterim) {
-      interimBuffer = (interimBuffer + " " + latestInterim).trim();
-      lastInterimTs = now;
-      if (endpointTimer) clearTimeout(endpointTimer);
-      endpointTimer = setTimeout(() => {
-        if (!interimBuffer) return;
-        const gap = Date.now() - lastInterimTs;
-        if (gap >= SILENCE_ENDPOINT_MS && interimBuffer.length >= MIN_ENDPOINT_CHARS) {
-          if (!assistantSpeaking && !likelyEcho(interimBuffer, lastBotReply)) {
-            pushToBot(interimBuffer);
-          }
-          interimBuffer = ""; lastInterimTs = 0;
-        }
-      }, SILENCE_ENDPOINT_MS + 10);
-    }
+    logUser(finalText);
+    sendToBot(finalText);
   };
 
   if (asrWatchdog) clearInterval(asrWatchdog);
@@ -711,21 +629,6 @@ function stopBotAudio(){
   try { player.pause(); player.src = ""; player.currentTime = 0; } catch(_) {}
   assistantSpeaking = false;
   botSpeakingSince = 0;
-}
-
-function canSendNow() {
-  const now = Date.now();
-  if (now - lastSendTs < SEND_DEBOUNCE_MS) return false;
-  lastSendTs = now;
-  return true;
-}
-
-function pushToBot(text){
-  const t = (text || "").trim();
-  if (!t) return;
-  if (!canSendNow()) return;
-  logUser(t);
-  sendToBot(t);
 }
 
 async function sendToBot(text){
