@@ -6,6 +6,7 @@
 # - Robust LLM error logging + safe fallback that avoids duplicate blocking
 # - Modal/backdrop fix + button click fixes
 # - Minimal change: /api/intro always sends an intro (no double-intro warning)
+# - NEW: Adjacent (anticipatory) processing — quick teaser reply on interim ASR
 
 import base64, re, time, random, os, threading, json, sys
 from collections import deque, defaultdict
@@ -19,11 +20,11 @@ from urllib3.util.retry import Retry
 
 # ========= YOUR API KEYS (LOCAL ONLY) =========
 ELEVEN_API_KEY  = "3e7c3a7c14cec12c34324bd0d25a063ae44b3f4c09b1d25ac1dbcd5a606652d8"
-ELEVEN_VOICE_ID = "zmcVlqmyk3Jpn5AVYcAL"
+ELEVEN_VOICE_ID = "X03mvPuTfprif8QBAVeJ"
 
 # Google Gemini API (AI Studio)
 GOOGLE_API_KEY  = "AIzaSyBqKNG0-SEQapQBtZaHa_YdiabBfm_ADLY"
-GEMINI_MODEL    = "gemini-2.0-flash"   # working on v1beta generateContent
+GEMINI_MODEL    = "gemini-2.0-flash"
 
 ASSISTANT_NAME  = "Tahlia"
 
@@ -47,6 +48,7 @@ class ClientState:
     last_reply: str = ""
     recent_assist: deque = field(default_factory=lambda: deque(maxlen=6))
     recent_style: deque = field(default_factory=lambda: deque(maxlen=4))
+    last_adjacent_ts: float = 0.0  # cooldown for teaser generation
 
 state_lock = threading.Lock()
 clients: dict[str, ClientState] = defaultdict(ClientState)
@@ -156,7 +158,7 @@ def _to_gemini_contents(messages):
         contents.append({"role": role, "parts": [{"text": text}]})
     return contents
 
-def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360):
+def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360, timeout=DEFAULT_TIMEOUT):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GOOGLE_API_KEY}"
     payload = {
         "contents": _to_gemini_contents(messages),
@@ -166,10 +168,9 @@ def gemini_chat(messages, model=GEMINI_MODEL, temperature=0.55, max_tokens=360):
             "topP": 0.9,
             "topK": 40
         }
-        # safetySettings intentionally omitted (defaults apply)
     }
     headers = {"Content-Type": "application/json"}
-    r = session.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+    r = session.post(url, headers=headers, json=payload, timeout=timeout)
 
     if r.status_code >= 400:
         sys.stderr.write(f"\n[GEMINI HTTP {r.status_code}] {r.text[:500]}\n")
@@ -253,6 +254,31 @@ def llm_reply(st: ClientState, user_text: str) -> tuple[str, str]:
     st.recent_assist.append(final)
     return final, dbg
 
+# ---- Quick teaser (adjacent) ----
+ADJ_MIN_CHARS = 14
+ADJ_COOLDOWN_S = 1.8
+
+def llm_teaser(st: ClientState, user_prefix: str) -> tuple[str, str]:
+    # Do NOT add to history. This is a provisional one-liner based on the prefix only.
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content":
+         ("For THIS reply only: Generate a SINGLE short sentence as a provisional response to the user's partial utterance. "
+          "Be concrete and specific to the snippet; avoid long windups and hedging. "
+          "Prefer statements over questions unless a question is obvious and crisp. "
+          "Do not use generic empathy phrases or platitudes. "
+          "This will be spoken immediately and may be replaced by a fuller answer.")},
+        {"role": "user", "content": user_prefix.strip()}
+    ]
+    try:
+        text, status = gemini_chat(msgs, temperature=0.4, max_tokens=40, timeout=(3, 12))
+        if not text:
+            return "Okay—go on.", "adj_empty"
+        return concise(text, max_chars=140, max_sents=1), "adj_ok"
+    except Exception as e:
+        sys.stderr.write(f"\n[ADJ ERROR] {e}\n")
+        return "", "adj_err"
+
 # ========= ElevenLabs TTS =========
 def tts_b64(text: str):
     if not ELEVEN_API_KEY: return "", "Missing ELEVENLABS_API_KEY"
@@ -288,7 +314,6 @@ def api_intro():
     data = request.get_json(force=True, silent=False) or {}
     cid = (data.get("cid") or "").strip()
 
-    # Minimal change: ALWAYS reset and speak the intro. No more "double_intro_blocked".
     reset_state(cid)
     st = get_state(cid)
     intro = f"Hey, I'm {ASSISTANT_NAME}. Your mental health assistant."
@@ -300,7 +325,7 @@ def api_intro():
     audio, tts_err = tts_b64(intro)
     return jsonify({"reply": intro, "audio": audio, "tts_error": tts_err, "dbg": "intro"}), 200
 
-# ========= API: chat reply =========
+# ========= API: chat reply (final) =========
 @app.post("/api/reply")
 def api_reply():
     data = request.get_json(force=True, silent=False) or {}
@@ -346,6 +371,40 @@ def api_reply():
     audio, tts_err = tts_b64(reply)
     st.last_reply = reply
     return jsonify({"reply": reply, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
+
+# ========= API: adjacent teaser (provisional) =========
+@app.post("/api/adjacent")
+def api_adjacent():
+    data = request.get_json(force=True, silent=False) or {}
+    cid = (data.get("cid") or "").strip()
+    prefix = (data.get("prefix") or "").strip()
+    if not prefix or len(prefix) < ADJ_MIN_CHARS:
+        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "adj_short"}), 200
+
+    st = get_state(cid)
+    # Cooldown so we don't spam multiple teasers per breath
+    now = time.time()
+    if now - (st.last_adjacent_ts or 0) < ADJ_COOLDOWN_S:
+        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "adj_cooldown"}), 200
+
+    # Crisis/stop checks on prefix just in case
+    lw = norm(prefix)
+    if contains_stop_command(lw):
+        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": "adj_stop"}), 200
+    if detect_crisis(lw):
+        teaser = concise("If you’re in immediate danger, call 911. In the U.S., text or call 988 for the Suicide & Crisis Lifeline.")
+        audio, tts_err = tts_b64(teaser)
+        st.last_adjacent_ts = time.time()
+        return jsonify({"reply": teaser, "audio": audio, "tts_error": tts_err, "dbg": "adj_crisis"}), 200
+
+    teaser, dbg = llm_teaser(st, prefix)
+    if not teaser:
+        return jsonify({"reply": "", "audio": "", "tts_error": "", "dbg": dbg}), 200
+
+    # Don't store in history; but keep last_reply for echo filter on client
+    audio, tts_err = tts_b64(teaser)
+    st.last_adjacent_ts = time.time()
+    return jsonify({"reply": teaser, "audio": audio, "tts_error": tts_err, "dbg": dbg}), 200
 
 # ========= API: assistant speech ACK =========
 @app.post("/api/ack_assistant")
@@ -484,6 +543,13 @@ const ECHO_WINDOW_MS = 1800;
 let audioCtx = null, mediaSrc = null, analyser = null, dataArray = null;
 let volEMA = 0;
 
+// ---- Adjacent processing controls ----
+let adjTimer = null;
+let adjCooldownUntil = 0;
+const ADJ_DEBOUNCE_MS = 220;
+const ADJ_COOLDOWN_MS = 1800; // match server
+const ADJ_MIN_CHARS = 14;
+
 function setupAudioAnalyzer(){
   if (audioCtx) return;
   try {
@@ -576,6 +642,7 @@ function ensureASR(){
 
   rec.onresult = (evt) => {
     let finalText = "";
+    let interimBest = "";
     const now = Date.now();
 
     for (let i = evt.resultIndex; i < evt.results.length; i++) {
@@ -583,11 +650,23 @@ function ensureASR(){
       const txt = (res[0]?.transcript || "").trim();
 
       if (!res.isFinal && txt) {
+        // Keep the longest interim we saw in this batch
+        if (txt.length > interimBest.length) interimBest = txt;
         const elapsed = now - botSpeakingSince;
         if (assistantSpeaking && botSpeakingSince && elapsed > 700) wantsInterrupt = true;
       }
 
       if (res.isFinal) finalText += txt + " ";
+    }
+
+    // ---- Adjacent processing trigger on confident interim ----
+    if (!assistantSpeaking && interimBest && interimBest.length >= ADJ_MIN_CHARS) {
+      if (!adjTimer && Date.now() > adjCooldownUntil) {
+        adjTimer = setTimeout(() => {
+          adjTimer = null;
+          fireAdjacent(interimBest);
+        }, ADJ_DEBOUNCE_MS);
+      }
     }
 
     finalText = (finalText || "").trim();
@@ -631,6 +710,36 @@ function stopBotAudio(){
   botSpeakingSince = 0;
 }
 
+async function fireAdjacent(prefix){
+  // cooldown window
+  adjCooldownUntil = Date.now() + ADJ_COOLDOWN_MS;
+
+  try {
+    const r = await fetch("/api/adjacent", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ cid: clientId, prefix })
+    });
+    const d = await safeJson(r);
+    if (d.dbg) logMeta("Server: " + d.dbg);
+    if (d.error_text) logErr("Server raw: " + d.error_text);
+    if (d.tts_error) logErr("TTS: " + d.tts_error);
+
+    if (d.reply) { lastBotReply = d.reply; logBot(d.reply + " (teaser)"); }
+    if (d.audio) {
+      try {
+        player.pause(); player.src = d.audio;
+        assistantSpeaking = true; botSpeakingSince = Date.now();
+        setupAudioAnalyzer();
+        if (audioCtx?.state === "suspended") { try { audioCtx.resume(); } catch(_){} }
+        await player.play();
+        fetch("/api/ack_assistant", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ cid: clientId }) }).catch(()=>{});
+      } catch(e){ logErr("Audio play failed: " + e); }
+    }
+  } catch(e){
+    logErr("Fetch /api/adjacent failed: " + e);
+  }
+}
+
 async function sendToBot(text){
   const lw = (text || "").trim().toLowerCase();
 
@@ -662,11 +771,15 @@ async function sendToBot(text){
     if (d.error_text) logErr("Server raw: " + d.error_text);
     if (d.tts_error) logErr("TTS: " + d.tts_error);
 
-    if (d.reply && d.reply === lastBotReply) return;
-    if (d.reply) { lastBotReply = d.reply; logBot(d.reply); }
+    if (d.reply && d.reply === lastBotReply) {
+      // identical to teaser; do nothing
+    } else if (d.reply) {
+      lastBotReply = d.reply; logBot(d.reply);
+    }
 
     if (d.audio) {
       try {
+        // Replace any teaser currently speaking
         player.pause(); player.src = d.audio;
         assistantSpeaking = true; botSpeakingSince = Date.now();
         setupAudioAnalyzer();
@@ -739,5 +852,5 @@ startBtn.addEventListener("click", async () => {
     return resp
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5050))  # Render injects PORT
+    port = int(os.environ.get("PORT", 5050))
     app.run(host="0.0.0.0", port=port, debug=True)
